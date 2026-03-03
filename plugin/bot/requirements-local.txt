@@ -1,0 +1,8 @@
+# Minimal dependencies for local-only mode (no Docker, no remote servers)
+playwright>=1.40.0
+python-dotenv>=1.0.0
+httpx>=0.24.0
+pyyaml>=6.0
+flask>=3.0.0
+Pillow>=10.0.0
+pillow-heif>=0.16.0

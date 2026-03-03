@@ -1,0 +1,12 @@
+{
+  "plugins": [
+    {
+      "name": "douzonebot",
+      "description": "더존 경비 자동화 도우미. 설치, 실행, 문제 해결을 안내합니다.",
+      "source": {
+        "source": "relative",
+        "path": "./plugin"
+      }
+    }
+  ]
+}

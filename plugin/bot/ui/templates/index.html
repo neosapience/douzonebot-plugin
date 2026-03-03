@@ -1,0 +1,1020 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>더존 경비 자동화</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        /* ================================================================
+           D2Coding Font
+           ================================================================ */
+        @font-face {
+            font-family: 'D2Coding';
+            src: url('https://cdn.jsdelivr.net/gh/projectnoonnu/noonfonts_three@1.0/D2Coding.woff') format('woff');
+            font-weight: normal;
+            font-style: normal;
+            font-display: swap;
+        }
+
+        /* ================================================================
+           Ayu Dark Theme Variables
+           ================================================================ */
+        :root {
+            --bg-primary: #0b0e14;
+            --bg-secondary: #0d1117;
+            --bg-input: #151a22;
+            --text-primary: #bfbdb6;
+            --text-secondary: #565b66;
+            --accent: #f9af4f;
+            --accent-hover: #e59a3a;
+            --border: #2d3640;
+            --border-light: #1c2128;
+            --success: #3fb950;
+            --error: #f85149;
+            --warning: #d29922;
+            --info: #58a6ff;
+            --font-main: 'D2Coding', 'D2 Coding', 'Consolas', 'Monaco', monospace;
+        }
+
+        /* ================================================================
+           Global Reset & Base
+           ================================================================ */
+        *, *::before, *::after { box-sizing: border-box; }
+
+        body {
+            background-color: var(--bg-primary);
+            color: var(--text-primary);
+            font-family: var(--font-main);
+            font-size: 13px;
+            line-height: 1.6;
+            margin: 0;
+            padding: 0;
+        }
+
+        a { color: var(--accent); text-decoration: none; }
+        a:hover { color: var(--accent-hover); }
+
+        ::selection {
+            background-color: var(--accent);
+            color: var(--bg-primary);
+        }
+
+        /* Custom scrollbar */
+        ::-webkit-scrollbar { width: 8px; height: 8px; }
+        ::-webkit-scrollbar-track { background: var(--bg-secondary); }
+        ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+        ::-webkit-scrollbar-thumb:hover { background: var(--accent); }
+
+        /* ================================================================
+           App Header
+           ================================================================ */
+        .app-header {
+            background: var(--bg-secondary);
+            border-bottom: 1px solid var(--border);
+            padding: 12px 24px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .app-header .title {
+            font-size: 15px;
+            font-weight: bold;
+            color: var(--accent);
+            letter-spacing: 1px;
+        }
+
+        .app-header .subtitle {
+            font-size: 11px;
+            color: var(--text-secondary);
+            margin-left: 12px;
+        }
+
+        .header-right {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            display: inline-block;
+            margin-right: 4px;
+        }
+
+        .status-dot.ok { background: var(--success); }
+        .status-dot.warn { background: var(--warning); }
+        .status-dot.err { background: var(--error); }
+        .status-dot.checking { background: var(--text-secondary); animation: pulse 1.5s infinite; }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.3; }
+        }
+
+        .header-badge {
+            font-size: 11px;
+            padding: 2px 8px;
+            border-radius: 3px;
+            border: 1px solid var(--border);
+            color: var(--text-secondary);
+        }
+
+        .header-badge.provider {
+            color: var(--info);
+            border-color: var(--info);
+        }
+
+        /* ================================================================
+           Content
+           ================================================================ */
+        .app-content {
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px 24px;
+        }
+
+        /* ================================================================
+           Panel / Section
+           ================================================================ */
+        .panel {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-light);
+            border-radius: 4px;
+            padding: 20px;
+            margin-bottom: 16px;
+        }
+
+        .panel-title {
+            color: var(--accent);
+            font-size: 13px;
+            font-weight: bold;
+            margin-bottom: 14px;
+            padding-bottom: 8px;
+            border-bottom: 1px solid var(--border-light);
+        }
+
+        /* ================================================================
+           Form Elements — Override Bootstrap
+           ================================================================ */
+        .form-label {
+            color: var(--text-primary);
+            font-size: 12px;
+            font-weight: bold;
+            margin-bottom: 4px;
+        }
+
+        .form-hint {
+            color: var(--text-secondary);
+            font-size: 11px;
+            margin-top: 2px;
+        }
+
+        .path-validation-status {
+            font-size: 12px;
+            margin-top: 4px;
+            min-height: 18px;
+            transition: opacity 0.2s;
+        }
+        .path-validation-status.ok { color: var(--success); }
+        .path-validation-status.warn { color: var(--warning, #f0ad4e); }
+        .path-validation-status.err { color: var(--error); }
+        .path-validation-status.loading { color: var(--text-secondary); }
+
+        .form-control, .form-select {
+            background-color: var(--bg-input);
+            border: 1px solid var(--border);
+            border-bottom-color: var(--accent);
+            color: var(--text-primary);
+            font-family: var(--font-main);
+            font-size: 12px;
+            padding: 8px 10px;
+            border-radius: 3px;
+        }
+
+        .form-control:focus, .form-select:focus {
+            background-color: var(--bg-input);
+            border-color: var(--accent);
+            color: var(--text-primary);
+            box-shadow: 0 0 0 2px rgba(249, 175, 79, 0.15);
+        }
+
+        .form-control::placeholder {
+            color: var(--text-secondary);
+            opacity: 0.6;
+        }
+
+        textarea.form-control {
+            resize: vertical;
+            min-height: 80px;
+        }
+
+        /* ================================================================
+           Buttons
+           ================================================================ */
+        .btn-accent {
+            background-color: var(--bg-input);
+            border: 1px solid var(--accent);
+            color: var(--accent);
+            font-family: var(--font-main);
+            font-weight: bold;
+            font-size: 13px;
+            padding: 10px 24px;
+            border-radius: 3px;
+            cursor: pointer;
+            transition: all 0.15s;
+        }
+
+        .btn-accent:hover {
+            background-color: var(--accent);
+            color: var(--bg-primary);
+        }
+
+        .btn-accent:disabled {
+            background-color: var(--bg-secondary);
+            border-color: var(--border);
+            color: var(--text-secondary);
+            cursor: not-allowed;
+        }
+
+        .btn-ghost {
+            background: transparent;
+            border: 1px solid var(--border);
+            color: var(--text-secondary);
+            font-family: var(--font-main);
+            font-size: 12px;
+            padding: 6px 14px;
+            border-radius: 3px;
+            cursor: pointer;
+            transition: all 0.15s;
+        }
+
+        .btn-ghost:hover {
+            border-color: var(--text-primary);
+            color: var(--text-primary);
+        }
+
+        /* ================================================================
+           Receipt Tabs
+           ================================================================ */
+        .receipt-tabs {
+            display: flex;
+            gap: 0;
+            margin-bottom: 12px;
+        }
+
+        .receipt-tab {
+            padding: 6px 16px;
+            cursor: pointer;
+            border: 1px solid var(--border);
+            color: var(--text-secondary);
+            font-size: 12px;
+            transition: all 0.15s;
+            user-select: none;
+        }
+
+        .receipt-tab:first-child { border-radius: 3px 0 0 3px; }
+        .receipt-tab:last-child { border-radius: 0 3px 3px 0; border-left: none; }
+
+        .receipt-tab.active {
+            background: var(--accent);
+            color: var(--bg-primary);
+            border-color: var(--accent);
+        }
+
+        .receipt-tab-content { display: none; }
+        .receipt-tab-content.active { display: block; }
+
+        /* Drop zone */
+        .drop-zone {
+            border: 2px dashed var(--border);
+            border-radius: 4px;
+            padding: 24px;
+            text-align: center;
+            color: var(--text-secondary);
+            transition: all 0.2s;
+            cursor: pointer;
+        }
+
+        .drop-zone:hover, .drop-zone.drag-over {
+            border-color: var(--accent);
+            color: var(--accent);
+            background: rgba(249, 175, 79, 0.03);
+        }
+
+        .drop-zone .drop-icon { font-size: 24px; margin-bottom: 8px; }
+        .drop-zone .drop-text { font-size: 12px; }
+        .drop-zone .drop-btn { margin-top: 8px; font-size: 11px; color: var(--accent); text-decoration: underline; cursor: pointer; }
+
+        .file-list {
+            margin-top: 8px;
+            font-size: 11px;
+        }
+
+        .file-list-item {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 4px 8px;
+            border-bottom: 1px solid var(--border-light);
+        }
+
+        .file-list-item .remove-file {
+            color: var(--error);
+            cursor: pointer;
+            font-size: 14px;
+        }
+
+        /* Folder input */
+        .folder-input-group {
+            display: flex;
+            gap: 8px;
+        }
+
+        .folder-input-group .form-control { flex: 1; }
+
+        /* ================================================================
+           Connection Indicator (inline)
+           ================================================================ */
+        .conn-indicator {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            font-size: 11px;
+            margin-left: 8px;
+        }
+
+        .conn-indicator .dot {
+            width: 6px; height: 6px; border-radius: 50%;
+        }
+
+        /* ================================================================
+           Modal — Override Bootstrap
+           ================================================================ */
+        .modal-content {
+            background-color: var(--bg-secondary);
+            border: 1px solid var(--border);
+            color: var(--text-primary);
+            font-family: var(--font-main);
+        }
+
+        .modal-header {
+            border-bottom: 1px solid var(--border);
+            padding: 12px 16px;
+        }
+
+        .modal-header .modal-title {
+            font-size: 14px;
+            font-weight: bold;
+            color: var(--accent);
+        }
+
+        .modal-body { padding: 16px; }
+
+        .modal-footer {
+            border-top: 1px solid var(--border);
+            padding: 10px 16px;
+        }
+
+        .btn-close { filter: invert(1) grayscale(100%) brightness(200%); }
+
+        /* Folder picker specific */
+        .folder-list {
+            max-height: 300px;
+            overflow-y: auto;
+            border: 1px solid var(--border-light);
+            border-radius: 3px;
+        }
+
+        .folder-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 6px 10px;
+            cursor: pointer;
+            font-size: 12px;
+            border-bottom: 1px solid var(--border-light);
+            transition: background 0.1s;
+        }
+
+        .folder-item:hover { background: rgba(249, 175, 79, 0.05); }
+        .folder-item.selected { background: var(--accent); color: var(--bg-primary); }
+
+        .folder-path-input {
+            font-size: 12px;
+            padding: 6px 10px;
+            background: var(--bg-primary);
+            border: 1px solid var(--border-light);
+            border-radius: 3px;
+            color: var(--accent);
+            flex: 1;
+            font-family: inherit;
+            outline: none;
+        }
+        .folder-path-input:focus {
+            border-color: var(--accent);
+        }
+
+        /* ================================================================
+           Toast Notifications
+           ================================================================ */
+        .toast-container {
+            position: fixed;
+            top: 16px;
+            right: 16px;
+            z-index: 9999;
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+
+        .toast-item {
+            padding: 10px 16px;
+            border-radius: 4px;
+            font-size: 12px;
+            border: 1px solid var(--border);
+            background: var(--bg-secondary);
+            color: var(--text-primary);
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            animation: slideIn 0.2s ease-out;
+            max-width: 360px;
+        }
+
+        .toast-item.success { border-left: 3px solid var(--success); }
+        .toast-item.error { border-left: 3px solid var(--error); }
+        .toast-item.warning { border-left: 3px solid var(--warning); }
+        .toast-item.info { border-left: 3px solid var(--info); }
+
+        @keyframes slideIn {
+            from { transform: translateX(100%); opacity: 0; }
+            to { transform: translateX(0); opacity: 1; }
+        }
+
+        /* ================================================================
+           Saved data indicator
+           ================================================================ */
+        .save-status {
+            text-align: center;
+            padding: 16px;
+            font-size: 12px;
+            color: var(--text-secondary);
+        }
+
+        .save-status.saved {
+            color: var(--success);
+        }
+
+        /* ================================================================
+           Utilities
+           ================================================================ */
+        .text-accent { color: var(--accent); }
+        .text-success { color: var(--success); }
+        .text-error { color: var(--error); }
+        .text-warning { color: var(--warning); }
+        .text-muted { color: var(--text-secondary) !important; }
+        .mt-sm { margin-top: 8px; }
+        .mb-sm { margin-bottom: 8px; }
+        .gap-row { display: flex; gap: 16px; }
+        .gap-row > * { flex: 1; }
+
+        @media (max-width: 768px) {
+            .gap-row { flex-direction: column; }
+        }
+    </style>
+</head>
+<body>
+
+    <!-- ================================================================
+         HEADER
+         ================================================================ -->
+    <div class="app-header">
+        <div style="display:flex;align-items:baseline;">
+            <span class="title">DOUZONE-BOT</span>
+            <span class="subtitle">경비 데이터 입력</span>
+        </div>
+        <div class="header-right">
+            <span class="header-badge provider" id="provider-badge" style="display:none;"></span>
+            <span id="connection-status" style="display:flex;align-items:center;font-size:11px;">
+                <span class="status-dot checking"></span>
+                <span>확인 중...</span>
+            </span>
+            <span class="header-badge" id="version-badge">v0.3</span>
+        </div>
+    </div>
+
+    <!-- ================================================================
+         INPUT FORM
+         ================================================================ -->
+    <div class="app-content">
+
+        <form id="uploadForm" autocomplete="off">
+            <!-- User & CDP -->
+            <div class="panel">
+                <div class="panel-title">기본 설정</div>
+                <div class="gap-row">
+                    <div>
+                        <label class="form-label">사용자 이름</label>
+                        <input type="text" class="form-control" name="user_name" id="input-user-name" placeholder="홍길동">
+                    </div>
+                    <div>
+                        <label class="form-label">
+                            CDP URL
+                            <span class="conn-indicator" id="cdp-indicator">
+                                <span class="dot" style="background:var(--text-secondary);"></span>
+                            </span>
+                        </label>
+                        <input type="text" class="form-control" name="cdp_url" id="input-cdp-url" value="http://localhost:9444">
+                    </div>
+                </div>
+            </div>
+
+            <!-- Memo -->
+            <div class="panel">
+                <div class="panel-title">메모 (참석자 정보)</div>
+                <textarea class="form-control" name="memo_text" id="input-memo" rows="4"></textarea>
+                <div class="form-hint">날짜별 참석자를 한 줄씩 입력하세요.</div>
+            </div>
+
+            <!-- Receipts -->
+            <div class="panel">
+                <div class="panel-title">영수증 이미지</div>
+                <div class="receipt-tabs">
+                    <div class="receipt-tab active" data-tab="upload" onclick="switchReceiptTab('upload')">파일 업로드</div>
+                    <div class="receipt-tab" data-tab="folder" onclick="switchReceiptTab('folder')">폴더 경로</div>
+                </div>
+
+                <!-- Tab: File Upload -->
+                <div class="receipt-tab-content active" id="tab-upload">
+                    <div class="drop-zone" id="drop-zone">
+                        <div class="drop-icon">&#128193;</div>
+                        <div class="drop-text">영수증 이미지를 여기에 끌어다 놓으세요</div>
+                        <div class="drop-btn">또는 파일 선택</div>
+                    </div>
+                    <input type="file" name="receipt_files" id="file-input" multiple accept=".jpg,.jpeg,.png,.heic,.heif,.bmp,.tiff,.tif,.md,.txt,.json" style="display:none;">
+                    <div class="file-list" id="file-list"></div>
+                </div>
+
+                <!-- Tab: Folder Path -->
+                <div class="receipt-tab-content" id="tab-folder">
+                    <div class="folder-input-group">
+                        <input type="text" class="form-control" id="input-folder-path" name="receipt_folder_path"
+                               placeholder="~/Desktop/receipts"
+                               oninput="PathValidator.scheduleValidation()"
+                               onpaste="PathValidator.scheduleValidation()">
+                        <button type="button" class="btn-ghost" onclick="FolderPicker.open()">찾아보기</button>
+                    </div>
+                    <div class="path-validation-status" id="path-validation-status"></div>
+                    <div class="form-hint">영수증 이미지가 있는 폴더 경로를 입력하세요 (예: ~/Desktop/receipts)</div>
+                </div>
+            </div>
+
+            <!-- Save Button -->
+            <div class="panel">
+                <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;">
+                    <div class="save-status" id="save-status"></div>
+                    <button type="submit" class="btn-accent" id="btn-save">저장</button>
+                </div>
+            </div>
+        </form>
+
+        <div class="form-hint" style="text-align:center;margin-top:12px;">
+            데이터를 저장하면 Claude 에이전트가 터미널에서 자동화 파이프라인을 실행합니다.
+        </div>
+
+    </div>
+
+    <!-- ================================================================
+         FOLDER PICKER MODAL
+         ================================================================ -->
+    <div class="modal fade" id="folderModal" tabindex="-1">
+        <div class="modal-dialog modal-dialog-centered">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h5 class="modal-title">폴더 선택</h5>
+                    <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+                </div>
+                <div class="modal-body">
+                    <div style="display:flex;gap:6px;margin-bottom:10px;">
+                        <input type="text" class="folder-path-input" id="folder-current-path" value="~"
+                               placeholder="경로 입력 (예: ~/Desktop, C:\Users\...)"
+                               onkeydown="if(event.key==='Enter'){event.preventDefault();FolderPicker.navigate(this.value.trim());}">
+                        <button type="button" class="btn-ghost" style="white-space:nowrap;padding:4px 10px;font-size:12px;"
+                                onclick="FolderPicker.navigate(document.getElementById('folder-current-path').value.trim())">이동</button>
+                    </div>
+                    <div class="folder-list" id="folder-list"></div>
+                </div>
+                <div class="modal-footer">
+                    <button class="btn-ghost" data-bs-dismiss="modal">취소</button>
+                    <button class="btn-accent" id="folder-select-btn" onclick="FolderPicker.select()">이 폴더 선택</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ================================================================
+         TOAST CONTAINER
+         ================================================================ -->
+    <div class="toast-container" id="toast-container"></div>
+
+
+    <!-- ================================================================
+         SCRIPTS
+         ================================================================ -->
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+    'use strict';
+
+    // ================================================================
+    // STORAGE MODULE
+    // ================================================================
+    const Storage = {
+        SETTINGS_KEY: 'douzone-bot-settings',
+        SETTINGS_VERSION: 2,
+
+        loadSettings() {
+            try {
+                const raw = localStorage.getItem(this.SETTINGS_KEY);
+                if (!raw) return null;
+                const data = JSON.parse(raw);
+                if (data.version !== this.SETTINGS_VERSION) return null;
+                return data;
+            } catch { return null; }
+        },
+
+        saveSettings(partial) {
+            const current = this.loadSettings() || { version: this.SETTINGS_VERSION };
+            Object.assign(current, partial, { version: this.SETTINGS_VERSION });
+            localStorage.setItem(this.SETTINGS_KEY, JSON.stringify(current));
+        }
+    };
+
+    // ================================================================
+    // TOAST MODULE
+    // ================================================================
+    const Toast = {
+        show(message, type = 'info', duration = 3000) {
+            const container = document.getElementById('toast-container');
+            const icons = { info: '\u2139', success: '\u2713', warning: '\u26A0', error: '\u2717' };
+            const el = document.createElement('div');
+            el.className = `toast-item ${type}`;
+            el.innerHTML = `<span>${icons[type] || ''}</span><span>${message}</span>`;
+            container.appendChild(el);
+            setTimeout(() => {
+                el.style.opacity = '0';
+                el.style.transition = 'opacity 0.3s';
+                setTimeout(() => el.remove(), 300);
+            }, duration);
+        }
+    };
+
+    // ================================================================
+    // APP STATE
+    // ================================================================
+    const AppState = {
+        droppedFiles: [],
+        activeReceiptTab: 'upload',
+    };
+
+    // ================================================================
+    // FOLDER PICKER MODULE
+    // ================================================================
+    const FolderPicker = {
+        modal: null,
+        currentPath: '~',
+
+        _escapePath(p) {
+            // Escape for safe use in HTML attributes
+            return p.replace(/&/g, '&amp;').replace(/'/g, '&#39;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
+        },
+
+        _escapeText(t) {
+            return t.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        },
+
+        open() {
+            if (!this.modal) {
+                this.modal = new bootstrap.Modal(document.getElementById('folderModal'));
+            }
+            // Start from current input value or home
+            const current = document.getElementById('input-folder-path').value.trim();
+            this.navigate(current || '~');
+            this.modal.show();
+        },
+
+        async navigate(path) {
+            this.currentPath = path;
+            document.getElementById('folder-current-path').value = path;
+            const list = document.getElementById('folder-list');
+            list.innerHTML = '<div style="padding:12px;color:var(--text-secondary);">로딩 중...</div>';
+
+            try {
+                const res = await fetch(`/browse?path=${encodeURIComponent(path)}&mode=dirs`);
+                const data = await res.json();
+
+                if (data.status === 'error') {
+                    list.innerHTML = `<div style="padding:12px;color:var(--error);">${this._escapeText(data.message)}</div>`;
+                    return;
+                }
+
+                this.currentPath = data.current;
+                document.getElementById('folder-current-path').value = data.current;
+
+                list.innerHTML = '';
+
+                if (data.parent !== null) {
+                    const item = document.createElement('div');
+                    item.className = 'folder-item';
+                    item.innerHTML = '<span>\uD83D\uDCC1</span> <span style="color:var(--text-secondary);">..</span>';
+                    item.addEventListener('click', () => this.navigate(data.parent));
+                    list.appendChild(item);
+                }
+                data.dirs.forEach(d => {
+                    const fullPath = data.current === '~' ? `~/${d}` : `${data.current}/${d}`;
+                    const item = document.createElement('div');
+                    item.className = 'folder-item';
+                    item.innerHTML = `<span>\uD83D\uDCC2</span> ${this._escapeText(d)}`;
+                    item.addEventListener('click', () => this.navigate(fullPath));
+                    list.appendChild(item);
+                });
+                if (data.dirs.length === 0 && data.parent === null) {
+                    list.innerHTML = '<div style="padding:12px;color:var(--text-secondary);">빈 폴더</div>';
+                }
+            } catch (e) {
+                list.innerHTML = `<div style="padding:12px;color:var(--error);">오류: ${this._escapeText(e.message)}</div>`;
+            }
+        },
+
+        select() {
+            document.getElementById('input-folder-path').value = this.currentPath;
+            Storage.saveSettings({ last_receipt_path: this.currentPath });
+            if (this.modal) this.modal.hide();
+            Toast.show(`폴더 선택: ${this.currentPath}`, 'success');
+            PathValidator.validate();
+        }
+    };
+
+    // ================================================================
+    // PATH VALIDATOR MODULE
+    // ================================================================
+    const PathValidator = {
+        _timer: null,
+
+        scheduleValidation() {
+            clearTimeout(this._timer);
+            this._timer = setTimeout(() => this.validate(), 400);
+        },
+
+        async validate() {
+            const input = document.getElementById('input-folder-path');
+            const statusEl = document.getElementById('path-validation-status');
+            const path = input.value.trim();
+
+            if (!path) {
+                statusEl.textContent = '';
+                statusEl.className = 'path-validation-status';
+                return;
+            }
+
+            statusEl.textContent = '확인 중...';
+            statusEl.className = 'path-validation-status loading';
+
+            try {
+                const res = await fetch(`/validate-path?path=${encodeURIComponent(path)}`);
+                const data = await res.json();
+
+                if (!data.valid) {
+                    statusEl.textContent = data.message || '유효하지 않은 경로';
+                    statusEl.className = 'path-validation-status err';
+                } else if (data.reason === 'no_images') {
+                    statusEl.textContent = '\u26A0 이미지 파일이 없습니다';
+                    statusEl.className = 'path-validation-status warn';
+                } else {
+                    let msg = `\u2713 이미지 ${data.images}장`;
+                    if (data.preocr > 0) msg += `, OCR 결과 ${data.preocr}개`;
+                    statusEl.textContent = msg;
+                    statusEl.className = 'path-validation-status ok';
+                }
+            } catch (e) {
+                statusEl.textContent = '';
+                statusEl.className = 'path-validation-status';
+            }
+        }
+    };
+
+    // ================================================================
+    // SAVE DATA (uploads to server for Claude agent to use)
+    // ================================================================
+    async function saveData(e) {
+        e.preventDefault();
+        const btn = document.getElementById('btn-save');
+        const statusEl = document.getElementById('save-status');
+        btn.disabled = true;
+        btn.textContent = '저장 중...';
+
+        // Save settings locally
+        Storage.saveSettings({
+            user_name: document.getElementById('input-user-name').value,
+            cdp_url: document.getElementById('input-cdp-url').value,
+            last_receipt_path: document.getElementById('input-folder-path').value,
+        });
+
+        // Build FormData
+        const form = document.getElementById('uploadForm');
+        const formData = new FormData(form);
+
+        // Handle receipt tab mode
+        if (AppState.activeReceiptTab === 'upload') {
+            formData.delete('receipt_folder_path');
+            if (AppState.droppedFiles.length > 0) {
+                formData.delete('receipt_files');
+                AppState.droppedFiles.forEach(f => formData.append('receipt_files', f));
+            }
+        } else {
+            formData.delete('receipt_files');
+        }
+
+        try {
+            const res = await fetch('/upload', { method: 'POST', body: formData });
+            const data = await res.json();
+            if (data.status !== 'success') {
+                throw new Error(data.message || '저장 실패');
+            }
+            statusEl.textContent = '저장 완료';
+            statusEl.className = 'save-status saved';
+            let toastMsg = '데이터가 저장되었습니다.';
+            if (data.receipts > 0) toastMsg += ` (영수증 ${data.receipts}장)`;
+            toastMsg += ' Claude 에이전트가 파이프라인을 실행합니다.';
+            Toast.show(toastMsg, 'success', 5000);
+        } catch (err) {
+            statusEl.textContent = '';
+            statusEl.className = 'save-status';
+            Toast.show('오류: ' + err.message, 'error', 5000);
+        } finally {
+            btn.disabled = false;
+            btn.textContent = '저장';
+        }
+    }
+
+    // ================================================================
+    // RECEIPT TAB SWITCHING
+    // ================================================================
+    function switchReceiptTab(tab) {
+        AppState.activeReceiptTab = tab;
+        document.querySelectorAll('.receipt-tab').forEach(t => {
+            t.classList.toggle('active', t.dataset.tab === tab);
+        });
+        document.querySelectorAll('.receipt-tab-content').forEach(c => {
+            c.classList.toggle('active', c.id === `tab-${tab}`);
+        });
+    }
+
+    // ================================================================
+    // DRAG & DROP
+    // ================================================================
+    function setupDragDrop() {
+        const zone = document.getElementById('drop-zone');
+        const fileInput = document.getElementById('file-input');
+
+        zone.addEventListener('click', () => fileInput.click());
+
+        zone.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            zone.classList.add('drag-over');
+        });
+
+        zone.addEventListener('dragleave', () => {
+            zone.classList.remove('drag-over');
+        });
+
+        zone.addEventListener('drop', (e) => {
+            e.preventDefault();
+            zone.classList.remove('drag-over');
+            const files = Array.from(e.dataTransfer.files);
+            addDroppedFiles(files);
+        });
+
+        fileInput.addEventListener('change', () => {
+            const files = Array.from(fileInput.files);
+            addDroppedFiles(files);
+        });
+    }
+
+    function addDroppedFiles(files) {
+        const imageExts = ['.jpg', '.jpeg', '.png', '.heic', '.heif', '.bmp', '.tiff', '.tif'];
+        const ocrExts = ['.ocr.md', '.ocr.txt', '.ocr.json'];
+        const valid = files.filter(f => {
+            const name = f.name.toLowerCase();
+            return imageExts.some(ext => name.endsWith(ext))
+                || ocrExts.some(ext => name.endsWith(ext));
+        });
+
+        AppState.droppedFiles = [...AppState.droppedFiles, ...valid];
+        renderFileList();
+
+        if (valid.length < files.length) {
+            Toast.show(`${files.length - valid.length}개 파일이 지원되지 않는 형식이어서 제외됨`, 'warning');
+        }
+    }
+
+    function renderFileList() {
+        const list = document.getElementById('file-list');
+        if (AppState.droppedFiles.length === 0) {
+            list.innerHTML = '';
+            return;
+        }
+        list.innerHTML = AppState.droppedFiles.map((f, i) => `
+            <div class="file-list-item">
+                <span>${f.name} <span class="text-muted">(${(f.size / 1024).toFixed(1)}KB)</span></span>
+                <span class="remove-file" onclick="removeFile(${i})">\u2717</span>
+            </div>
+        `).join('');
+    }
+
+    function removeFile(index) {
+        AppState.droppedFiles.splice(index, 1);
+        renderFileList();
+    }
+
+    // ================================================================
+    // PREFLIGHT CHECK
+    // ================================================================
+    async function checkConnection() {
+        const statusEl = document.getElementById('connection-status');
+        const providerEl = document.getElementById('provider-badge');
+        const cdpIndicator = document.getElementById('cdp-indicator');
+
+        try {
+            const res = await fetch('/preflight');
+            const data = await res.json();
+
+            if (data.status === 'ok') {
+                statusEl.innerHTML = '<span class="status-dot ok"></span><span>연결됨</span>';
+            } else {
+                let issues = [];
+                for (const [key, check] of Object.entries(data.checks)) {
+                    if (!check.available) issues.push(`${key}: ${check.message}`);
+                }
+                statusEl.innerHTML = '<span class="status-dot warn"></span><span>경고</span>';
+                statusEl.title = issues.join('\n');
+            }
+
+            // CDP indicator
+            if (data.checks.cdp) {
+                const dot = cdpIndicator.querySelector('.dot');
+                dot.style.background = data.checks.cdp.available ? 'var(--success)' : 'var(--error)';
+            }
+
+            // Provider badge
+            if (data.checks.llm) {
+                providerEl.style.display = '';
+                providerEl.textContent = data.checks.llm.provider;
+            }
+        } catch (e) {
+            statusEl.innerHTML = '<span class="status-dot err"></span><span>서버 오프라인</span>';
+        }
+    }
+
+    // ================================================================
+    // INITIALIZATION
+    // ================================================================
+    document.addEventListener('DOMContentLoaded', () => {
+        // Load saved settings
+        const settings = Storage.loadSettings();
+        if (settings) {
+            if (settings.user_name) document.getElementById('input-user-name').value = settings.user_name;
+            if (settings.cdp_url) document.getElementById('input-cdp-url').value = settings.cdp_url;
+            if (settings.last_receipt_path) {
+                document.getElementById('input-folder-path').value = settings.last_receipt_path;
+                PathValidator.validate();
+            }
+        }
+
+        // Load from server config (user_name, cdp_url from config.yaml)
+        fetch('/config').then(r => r.json()).then(data => {
+            if (data.user_name && !document.getElementById('input-user-name').value) {
+                document.getElementById('input-user-name').value = data.user_name;
+            }
+            // Always update CDP URL from config unless user has saved a custom one
+            if (data.cdp_url && (!settings || !settings.cdp_url)) {
+                document.getElementById('input-cdp-url').value = data.cdp_url;
+            }
+        }).catch(() => {});
+
+        // Setup form handler
+        document.getElementById('uploadForm').addEventListener('submit', saveData);
+
+        // Setup drag & drop
+        setupDragDrop();
+
+        // Preflight
+        checkConnection();
+    });
+    </script>
+</body>
+</html>

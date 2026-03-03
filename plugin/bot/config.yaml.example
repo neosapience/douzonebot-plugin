@@ -1,0 +1,32 @@
+# Douzone Bot Configuration
+# Copy this file to config.yaml and edit to your needs.
+
+# Mode: "local" (no remote servers) or "server" (uses central server)
+mode: local
+
+# Default attendee name (can be overridden with --user CLI flag)
+user_name: <이름>
+
+# Douzone groupware URL (opened automatically when Chrome launches)
+douzone_url: https://erp.neosapience.com
+
+# Chrome debug port for CDP connection (change if port conflicts with other apps)
+chrome_debug_port: 9444
+
+# AI Provider settings
+providers:
+  # LLM provider for memo parsing and transaction matching
+  # Options: claude_code | gemini_cli | openrouter
+  llm: claude_code
+
+  # Receipt OCR provider
+  # Options: claude_code | gemini_cli | openrouter | auto
+  # claude_code uses the sonnet model by default (best accuracy/speed for OCR)
+  receipt_ocr: claude_code
+
+# OpenRouter settings (only needed if using openrouter provider)
+# Sign up at https://openrouter.ai to get an API key
+# openrouter:
+#   api_key: sk-or-v1-your-key-here
+#   model: anthropic/claude-sonnet-4          # For text tasks (memo parsing, matching)
+#   vision_model: anthropic/claude-sonnet-4   # For receipt OCR (vision)
