@@ -14,7 +14,7 @@ allowed-tools: Bash, Read, Glob, Grep
 
 ## 경로 규칙
 
-- **BOT_DIR**: 이 SKILL.md 파일에서 2단계 상위 디렉토리의 `bot/` 폴더 (플러그인에 내장된 봇 코드)
+- **BOT_DIR**: 이 SKILL.md 파일의 grandparent 디렉토리 아래 `bot/` 폴더. 예: `plugin/skills/<skill>/SKILL.md` → `plugin/skills/` → `plugin/` → `plugin/bot/`
 - **DATA_DIR**: `~/douzone-bot/` (사용자 설정 파일 — config.yaml)
 
 모든 `uv run` 명령은 BOT_DIR에서 실행합니다.
@@ -37,7 +37,7 @@ allowed-tools: Bash, Read, Glob, Grep
      - **CDP 연결 실패**: "Chrome 자동화 창이 실행되지 않고 있습니다. `/douzonebot:chrome`으로 실행하거나 Chrome 설정 안내를 확인하세요."
      - **Claude Code CLI 실패**: "Claude CLI 인증이 안 되어 있습니다. `claude /login`으로 로그인하세요."
    - `[PASS]`는 간단히 확인 메시지
-   - `[WARN]`은 선택사항임을 설명
+   - `[WARN]`은 선택사항임을 설명 (예: Qwen2.5-VL OCR API — 없으면 Claude CLI로 대체)
 
 4. **요약**: 최종 결과를 명확히 전달:
    - 모두 통과: "모든 점검을 통과했습니다. `/douzonebot:run`으로 자동화를 실행할 수 있습니다."

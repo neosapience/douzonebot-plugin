@@ -13,7 +13,7 @@ argument-hint: "[mode: simple|full|dashboard]"
 
 ## 경로 규칙
 
-- **BOT_DIR**: 이 SKILL.md 파일에서 2단계 상위 디렉토리의 `bot/` 폴더 (플러그인에 내장된 봇 코드)
+- **BOT_DIR**: 이 SKILL.md 파일의 grandparent 디렉토리 아래 `bot/` 폴더. 예: `plugin/skills/<skill>/SKILL.md` → `plugin/skills/` → `plugin/` → `plugin/bot/`
 - **DATA_DIR**: `~/douzone-bot/` (사용자 설정 파일 — config.yaml)
 - **PLAN_FILE**: 실행 초반에 `mktemp`로 생성하는 임시 파일 (OS가 자동 정리)
 
@@ -103,10 +103,11 @@ CLI 전체 모드는 3가지 정보가 필요합니다. 순서대로 수집합�
    - 내용 미리보기 (첫 10줄): Read 도구로 확인
    - 메모가 없으면 `--memo` 플래그 생략 가능 (기본 참석자만 입력됨)
 
-3. **영수증 폴더**: 사용자에게 영수증 이미지 폴더 경로를 질문합니다 (예: `~/receipts/`).
-   - 폴더 존재 및 이미지 파일 개수 확인: `ls "<경로>"/*.{jpg,png,heic} 2>/dev/null | wc -l`
+3. **영수증 폴더**: 사용자에게 영수증 폴더 경로를 질문합니다 (예: `~/receipts/`).
+   - 폴더 존재 및 파일 개수 확인: `ls "<경로>"/*.{jpg,png,heic,pdf} 2>/dev/null | wc -l`
    - 영수증이 없으면 `--receipts` 플래그 생략 가능
-   - **사전 OCR 지원**: 영수증 이미지 옆에 `.ocr.md` (또는 `.ocr.txt`, `.ocr.json`) 파일이 있으면 Vision AI를 건너뛰고 해당 텍스트를 직접 사용합니다. OCR이 미리 준비된 영수증 폴더도 그대로 사용 가능합니다.
+   - **PDF 영수증 지원**: 이미지(JPG, PNG, HEIC)뿐만 아니라 PDF 파일도 영수증으로 처리됩니다.
+   - **사전 OCR 지원**: 영수증 파일 옆에 `.ocr.md` (또는 `.ocr.txt`, `.ocr.json`) 파일이 있으면 Vision AI를 건너뛰고 해당 텍스트를 직접 사용합니다. OCR이 미리 준비된 영수증 폴더도 그대로 사용 가능합니다.
 
 ## 간단 모드 실행
 
@@ -124,7 +125,7 @@ export PATH="$HOME/.local/bin:$USERPROFILE/.local/bin:$PATH" PYTHONIOENCODING=ut
 **먼저 임시 파일 경로를 생성합니다** (이후 단계에서 이 변수를 사용):
 
 ```bash
-PLAN_FILE=$(mktemp "${TMPDIR:-/tmp}/douzone_plan_XXXXXX.json")
+PLAN_FILE=$(mktemp "${TMPDIR:-/tmp}/douzone_plan_XXXXXXXXXX")
 echo "PLAN_FILE=$PLAN_FILE"
 ```
 
@@ -156,6 +157,7 @@ export PATH="$HOME/.local/bin:$USERPROFILE/.local/bin:$PATH" PYTHONIOENCODING=ut
 2. **확인이 필요한 항목** (출력에서 ⚠️ 표시된 행):
    - 메모 할당이 필요한 항목 ("needs assignment" 메시지)
    - 영수증이 없는 항목 ("No receipt" 메시지)
+   - SaaS 구독 거래에 영수증이 없는 항목 (예: Claude, GitHub, AWS 등 — 구독 증빙 첨부 권장)
    - 기타 낮은 신뢰도 항목
 3. 확인이 필요한 항목이 있으면 사용자에게 대화형으로 안내합니다
 4. 사용자가 승인하면 3단계로 진행합니다
@@ -187,7 +189,7 @@ export PATH="$HOME/.local/bin:$USERPROFILE/.local/bin:$PATH" PYTHONIOENCODING=ut
 
 다음 항목에 해당하는 행을 찾아 **사용자에게 수동 확인을 권장**합니다:
 - 2단계에서 `needs_clarification: true`였던 행 (매칭이 불확실했던 항목)
-- `pending_receipt: true`였던 행 (영수증 미첨부)
+- `pending_receipt: true`였던 행 (영수증 미첨부 — PG 또는 SaaS 구독 거래)
 - `confidence: "LOW"`였던 행 (신뢰도가 낮았던 매칭)
 - 자동화 실행 중 실패한 행
 

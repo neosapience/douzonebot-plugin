@@ -14,7 +14,7 @@ allowed-tools: Bash, Read, AskUserQuestion
 
 ## 경로 규칙
 
-- **BOT_DIR**: 이 SKILL.md 파일에서 2단계 상위 디렉토리의 `bot/` 폴더 (플러그인에 내장된 봇 코드)
+- **BOT_DIR**: 이 SKILL.md 파일의 grandparent 디렉토리 아래 `bot/` 폴더. 예: `plugin/skills/<skill>/SKILL.md` → `plugin/skills/` → `plugin/` → `plugin/bot/`
 - **DATA_DIR**: `~/douzone-bot/` (사용자 설정 파일 — config.yaml)
 
 모든 `uv run` 명령은 BOT_DIR에서 실행합니다.
@@ -47,6 +47,8 @@ CHROME_OK=true
 ```
 
 ## 단계 2: 실행 확인
+
+> ⚠️ **중요**: 자동화 Chrome 창을 **전체 화면(최대화)** 상태로 유지하세요. 창이 작으면 더존 UI 요소가 보이지 않아 자동화가 실패할 수 있습니다. 사용자에게 반드시 안내하세요.
 
 출력에서 `CHROME_OK=true`이면 성공. CDP 연결을 추가 확인:
 

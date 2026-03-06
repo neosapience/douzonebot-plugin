@@ -199,7 +199,7 @@ class DouzoneAutomation:
 
     def __init__(
         self,
-        cdp_url: str = "http://localhost:9444",
+        cdp_url: str = "http://localhost:9222",
         browser_use_api_key: str = None,
         debug: bool = False,
     ):
@@ -1995,7 +1995,7 @@ class DouzoneAutomation:
                                 )
                                 # Take screenshot of duplication
                                 await self.page.screenshot(
-                                    path=f"screenshots/duplication_row_{row_index + 1}.png"
+                                    path=f"/app/duplication_row_{row_index + 1}.png"
                                 )
 
                             # Verify validation updated AND attendee data is correct for this specific row
@@ -2048,7 +2048,7 @@ class DouzoneAutomation:
                                     f"Row {row_index + 1}: Validation cleared but attendee WRONG! Expected '{user_name}', got '{attendee_value}'"
                                 )
                                 await self.page.screenshot(
-                                    path=f"screenshots/wrong_row_{row_index + 1}.png"
+                                    path=f"/app/wrong_row_{row_index + 1}.png"
                                 )
                                 # Don't count as success, and abort to prevent cascade
                                 break
@@ -2170,7 +2170,7 @@ class DouzoneAutomation:
     # Screenshot Capture (Fast, using Playwright)
     # =========================================================================
 
-    async def take_screenshot(self, path: str = "screenshots/screenshot.png") -> str:
+    async def take_screenshot(self, path: str = "/app/screenshot.png") -> str:
         """Take a screenshot using Playwright (fast, works over tunnel)."""
         await self.page.screenshot(path=path)
         logger.debug(f"Screenshot saved to {path}")
@@ -3057,11 +3057,18 @@ class DouzoneAutomation:
                         debug.state("내용 unchanged, skipping")
 
             # Handle receipt attachment
-            has_receipt = data.receipt_path and os.path.exists(data.receipt_path)
-            debug.state(f"Has receipt: {has_receipt}, path: {data.receipt_path}")
+            all_receipts = data.receipt_paths or []
+            valid_receipts = [p for p in all_receipts if os.path.exists(p)]
+            missing_receipts = [p for p in all_receipts if not os.path.exists(p)]
+            if missing_receipts:
+                for mp in missing_receipts:
+                    debug.error(f"Receipt file not found (skipped): {mp}")
+                    logger.warning(f"Receipt file not found, skipping attachment: {mp}")
+            debug.state(f"Has {len(valid_receipts)} receipt(s)" +
+                        (f", {len(missing_receipts)} missing" if missing_receipts else ""))
 
-            if has_receipt:
-                # Has receipt - fill supplier info and attach file
+            if valid_receipts:
+                # Has receipt(s) - fill supplier info and attach file(s)
                 if data.needs_supplier_info:
                     debug.state("Needs supplier info, filling...")
                     # 실공급자상호
@@ -3084,14 +3091,15 @@ class DouzoneAutomation:
                             debug.fill("사업자번호", data.supplier_biz_no)
                             logger.info(f"Filled 사업자번호: {data.supplier_biz_no}")
 
-                # Attach receipt file
-                debug.state(f"Attaching receipt: {data.receipt_path}")
-                attached = await self.attach_file(data.receipt_path)
-                if not attached:
-                    debug.error(f"Failed to attach receipt")
-                    logger.warning(f"Failed to attach receipt: {data.receipt_path}")
-                else:
-                    debug.success(f"Receipt attached")
+                # Attach receipt file(s)
+                for receipt_path in valid_receipts:
+                    debug.state(f"Attaching receipt: {receipt_path}")
+                    attached = await self.attach_file(receipt_path)
+                    if not attached:
+                        debug.error(f"Failed to attach receipt")
+                        logger.warning(f"Failed to attach receipt: {receipt_path}")
+                    else:
+                        debug.success(f"Receipt attached: {os.path.basename(receipt_path)}")
 
             elif data.needs_supplier_info:
                 # Missing receipt for a transaction that needs supplier info
@@ -3329,11 +3337,20 @@ class DouzoneAutomation:
             debug.state(f"'PC에서 선택' visible: {is_visible}")
 
             if not is_visible:
-                debug.error("'PC에서 선택' option not visible")
-                logger.error("PC에서 선택 option not visible")
-                debug.keyboard("Escape", "closing dropdown menu")
-                await self.page.keyboard.press("Escape")  # Close menu
-                return False
+                # Retry: close menu, re-click add button, check again
+                debug.state("'PC에서 선택' not visible, retrying...")
+                logger.warning("PC에서 선택 option not visible, retrying")
+                await self.page.keyboard.press("Escape")
+                await asyncio.sleep(0.5)
+                await visible_btn.click()
+                await asyncio.sleep(0.8)
+                is_visible = await pc_option.is_visible()
+                if not is_visible:
+                    debug.error("'PC에서 선택' option not visible after retry")
+                    logger.error("PC에서 선택 option not visible after retry")
+                    await self.page.keyboard.press("Escape")
+                    return False
+                debug.state("'PC에서 선택' visible after retry")
 
             # Step 3: Use file chooser
             debug.action("FILECHOOSER", "waiting for file chooser dialog")
@@ -3495,7 +3512,8 @@ class DouzoneAutomation:
         print(
             f"     용도: {data.yongdo} {'(needs fill)' if data.needs_yongdo else '(already set)'}"
         )
-        print(f"     Receipt: {data.receipt_path or 'None'}")
+        receipt_list = ", ".join(data.receipt_paths) if data.receipt_paths else "None"
+        print(f"     Receipts: {receipt_list}")
         print(f"     Supplier: {data.supplier_name or 'None'}")
         print(f"{'=' * 60}")
 

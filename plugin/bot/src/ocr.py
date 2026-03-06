@@ -5,8 +5,9 @@ Uses AI Vision APIs to extract vendor information from receipt images.
 Key distinction: Platform/PG info (shown on card statement) vs Real Vendor info (needed for tax filing).
 
 Supported providers:
-- Claude Code CLI (primary - uses existing subscription, no API key needed)
+- Qwen2.5-VL OCR API (primary, on-premise)
 - Google Gemini API (fallback, requires GOOGLE_API_KEY)
+- Claude Code CLI (fallback - uses existing subscription, no API key needed)
 - Anthropic API (fallback, requires ANTHROPIC_API_KEY)
 
 Usage:
@@ -48,6 +49,12 @@ try:
     GEMINI_AVAILABLE = True
 except ImportError:
     GEMINI_AVAILABLE = False
+
+try:
+    from ocr_api.client import OCRClient
+    QWEN25VL_AVAILABLE = True
+except Exception:
+    QWEN25VL_AVAILABLE = False
 
 OPENROUTER_AVAILABLE = True  # Always available if httpx is installed (checked at runtime)
 
@@ -114,6 +121,17 @@ def _parse_json_response(response: str) -> dict:
 
     logger.warning("Could not parse JSON from response")
     return {"is_receipt": False, "confidence": "low"}
+
+
+def _is_qwen_reachable(host: str = "200.168.0.41", port: int = 8810, timeout: float = 2.0) -> bool:
+    """Quick check if Qwen2.5-VL OCR API server is reachable (fast fail for local mode)."""
+    import socket
+    try:
+        sock = socket.create_connection((host, port), timeout=timeout)
+        sock.close()
+        return True
+    except (socket.timeout, ConnectionRefusedError, OSError):
+        return False
 
 
 @dataclass
@@ -340,6 +358,7 @@ class ReceiptExtractor:
             '.png': 'image/png',
             '.gif': 'image/gif',
             '.webp': 'image/webp',
+            '.pdf': 'application/pdf',
         }
         media_type = media_types.get(suffix, 'image/jpeg')
         
@@ -374,7 +393,7 @@ class ReceiptExtractor:
                         "role": "user",
                         "content": [
                             {
-                                "type": "image",
+                                "type": "document" if media_type == "application/pdf" else "image",
                                 "source": {
                                     "type": "base64",
                                     "media_type": media_type,
@@ -551,6 +570,36 @@ class GeminiReceiptExtractor:
         return asyncio.get_event_loop().run_until_complete(self.extract(image_path))
 
 
+# Prompt for Qwen2.5-VL OCR API
+QWEN_RECEIPT_EXTRACTION_PROMPT = """This is a Korean receipt image. Extract the following information and return ONLY a JSON object:
+
+{
+  "is_receipt": true/false,
+  "platform_info": {
+    "name": "string or null",
+    "biz_num": "XXX-XX-XXXXX format or null"
+  },
+  "vendor_info": {
+    "name": "string or null",
+    "biz_num": "XXX-XX-XXXXX format or null",
+    "address": "string or null"
+  },
+  "transaction": {
+    "date": "YYYY-MM-DD or null",
+    "time": "HH:MM:SS or null",
+    "amount": number or null,
+    "currency": "KRW"
+  },
+  "confidence": "low" | "medium" | "high"
+}
+
+CRITICAL RULES:
+1. For delivery app receipts (배달의민족, 쿠팡이츠, 요기요), vendor_info should be the RESTAURANT, not the app company.
+2. platform_info is the payment platform (우아한형제들, 카카오페이, NHN KCP, etc.)
+3. Business registration numbers (사업자등록번호) must be in XXX-XX-XXXXX format.
+4. Return ONLY the JSON object, no markdown or extra text."""
+
+
 GEMINI_CLI_RECEIPT_PROMPT = """Read the file __FILENAME__. This is a Korean receipt image. Extract the following information and return ONLY a JSON object:
 
 {
@@ -659,6 +708,65 @@ class GeminiCliReceiptExtractor:
         return json.loads(stdout[json_start:])
 
 
+class QwenReceiptExtractor:
+    """
+    Extract vendor and transaction information from receipt images using Qwen2.5-VL OCR API.
+    """
+
+    def __init__(self, host: str = "200.168.0.41", port: int = 8810, timeout: int = 60):
+        if not QWEN25VL_AVAILABLE:
+            raise RuntimeError("Qwen2.5-VL OCR API client not available (ocr_api).")
+        self.client = OCRClient(host=host, port=port, timeout=timeout)
+
+    async def extract(self, image_path: str) -> ReceiptData:
+        if Path(image_path).suffix.lower() == '.pdf':
+            raise ValueError("Qwen2.5-VL does not support PDF files")
+        logger.info(f"Extracting receipt data from: {image_path} (using Qwen2.5-VL API)")
+
+        result = await asyncio.to_thread(
+            self.client.ocr,
+            image_path,
+            QWEN_RECEIPT_EXTRACTION_PROMPT,
+        )
+
+        if not result.get("success"):
+            raise RuntimeError(f"Qwen2.5-VL OCR error: {result.get('error', 'Unknown error')}")
+
+        response_text = result.get("text", "")
+        logger.debug(f"Qwen2.5-VL response: {response_text}")
+
+        data = self._parse_json_response(response_text)
+        receipt = ReceiptData.from_dict(data)
+        receipt.raw_text = response_text
+        receipt.provider = "qwen25vl"
+        receipt.model = result.get("model")
+
+        logger.info(f"Extraction complete. Vendor: {receipt.vendor_info.name}, Confidence: {receipt.confidence}")
+        return receipt
+
+    def _parse_json_response(self, response: str) -> dict:
+        """Parse JSON from Qwen2.5-VL response, handling potential formatting issues."""
+        try:
+            return json.loads(response)
+        except json.JSONDecodeError:
+            pass
+
+        json_block_match = re.search(r'```(?:json)?\s*([\s\S]*?)\s*```', response)
+        if json_block_match:
+            try:
+                return json.loads(json_block_match.group(1))
+            except json.JSONDecodeError:
+                pass
+
+        json_match = re.search(r'\{[\s\S]*\}', response)
+        if json_match:
+            try:
+                return json.loads(json_match.group())
+            except json.JSONDecodeError:
+                pass
+
+        logger.warning("Could not parse JSON from Qwen2.5-VL response")
+        return {"is_receipt": False, "confidence": "low"}
 
 # Prompt for Claude Code (slightly simpler since we can reference file directly)
 CLAUDE_CODE_EXTRACTION_PROMPT = """Read the file {image_path}. This is a receipt image. Extract the following information and return ONLY a JSON object (no other text):
@@ -738,8 +846,8 @@ class ClaudeCodeReceiptExtractor:
         if not path.exists():
             raise FileNotFoundError(f"Image file not found: {image_path}")
         
-        # Build prompt — use filename only (cwd is set to image directory)
-        prompt = CLAUDE_CODE_EXTRACTION_PROMPT.format(image_path=path.name)
+        # Build prompt
+        prompt = CLAUDE_CODE_EXTRACTION_PROMPT.format(image_path=image_path)
         
         # Build command
         # Use --no-session-persistence to avoid cluttering the user's session history
@@ -747,30 +855,20 @@ class ClaudeCodeReceiptExtractor:
         if self.model:
             cmd.extend(["--model", self.model])
         
-        # Run Claude Code CLI (strip ALL CLAUDE* env vars to avoid nested-session block)
-        import os as _os
-        _env = {k: v for k, v in _os.environ.items()
-                if not k.startswith("CLAUDE")}
+        # Run Claude Code CLI
         try:
             result = subprocess.run(
                 cmd,
                 capture_output=True,
                 text=True,
-                encoding="utf-8",
-                errors="replace",
                 timeout=self.timeout,
                 cwd=str(path.parent),  # Run from image directory
-                env=_env,
             )
             
             if result.returncode != 0:
                 logger.error(f"Claude Code CLI failed: {result.stderr}")
                 raise RuntimeError(f"Claude Code CLI error: {result.stderr}")
-
-            if not result.stdout:
-                logger.error(f"Claude Code CLI returned empty stdout. stderr: {result.stderr}")
-                raise RuntimeError(f"Claude CLI returned empty output (stdout=None). This may indicate too many concurrent processes. stderr: {result.stderr}")
-
+            
             # Parse the JSON output from Claude Code
             cli_output = json.loads(result.stdout)
             
@@ -778,8 +876,7 @@ class ClaudeCodeReceiptExtractor:
                 raise RuntimeError(f"Claude Code error: {cli_output.get('result', 'Unknown error')}")
             
             # Extract the actual result (which contains the receipt JSON)
-            # Use `or ""` because .get() returns None when key exists but value is None
-            response_text = cli_output.get("result") or ""
+            response_text = cli_output.get("result", "")
             logger.debug(f"Claude Code response: {response_text}")
             
             # Parse the nested JSON from the result
@@ -864,24 +961,10 @@ class OpenRouterReceiptExtractor:
 
         suffix = path.suffix.lower()
         mime_map = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
-                    ".gif": "image/gif", ".webp": "image/webp"}
+                    ".gif": "image/gif", ".webp": "image/webp", ".pdf": "application/pdf"}
         mime_type = mime_map.get(suffix, "image/jpeg")
 
-        prompt_text = """This is a Korean receipt image. Extract the following information and return ONLY a JSON object:
-
-{
-  "is_receipt": true/false,
-  "platform_info": {"name": "string or null", "biz_num": "XXX-XX-XXXXX format or null"},
-  "vendor_info": {"name": "string or null", "biz_num": "XXX-XX-XXXXX format or null", "address": "string or null"},
-  "transaction": {"date": "YYYY-MM-DD or null", "time": "HH:MM:SS or null", "amount": number or null, "currency": "KRW"},
-  "confidence": "low" | "medium" | "high"
-}
-
-CRITICAL RULES:
-1. For delivery app receipts, vendor_info should be the RESTAURANT, not the app company.
-2. platform_info is the payment platform.
-3. Business registration numbers must be in XXX-XX-XXXXX format.
-4. Return ONLY the JSON object, no markdown or extra text."""
+        prompt_text = QWEN_RECEIPT_EXTRACTION_PROMPT  # Reuse the same extraction prompt
 
         messages = [{
             "role": "user",
@@ -969,8 +1052,9 @@ async def extract_receipt_from_text(
 
     prompt = PREOCR_TEXT_EXTRACTION_PROMPT.format(ocr_text=ocr_text)
 
-    # Resolve provider — text-only
-    if provider == "auto":
+    # Resolve provider — text-only, so skip vision-only providers like Qwen
+    if provider in ("auto", "qwen25vl"):
+        # Qwen is image-only; fall through to text-capable providers
         candidates = []
         if CLAUDE_CODE_AVAILABLE:
             candidates.append("claude_code")
@@ -989,13 +1073,11 @@ async def extract_receipt_from_text(
     if provider == "claude_code":
         if not CLAUDE_CODE_AVAILABLE:
             raise RuntimeError("Claude Code CLI not found")
-        # Strip CLAUDE* env vars to avoid nested-session block
-        import os as _os
-        _env = {k: v for k, v in _os.environ.items() if not k.startswith("CLAUDE")}
         cmd = ["claude", "-p", prompt, "--output-format", "json",
                "--no-session-persistence", "--model", "sonnet"]
         result = await asyncio.to_thread(
-            subprocess.run, cmd, capture_output=True, text=True, timeout=30, env=_env
+            subprocess.run, cmd, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=30
         )
         if result.returncode != 0:
             raise RuntimeError(f"Claude CLI error: {result.stderr[:200]}")
@@ -1012,7 +1094,8 @@ async def extract_receipt_from_text(
             raise RuntimeError("Gemini CLI not found")
         cmd = ["gemini", "-o", "json", prompt]
         result = await asyncio.to_thread(
-            subprocess.run, cmd, capture_output=True, text=True, timeout=30
+            subprocess.run, cmd, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=30
         )
         if result.returncode != 0:
             raise RuntimeError(f"Gemini CLI error: {result.stderr[:200]}")
@@ -1055,18 +1138,27 @@ async def extract_receipt(image_path: str, api_key: Optional[str] = None, provid
     Args:
         image_path: Path to receipt image.
         api_key: API key (optional, uses env var if not provided).
-        provider: "auto", "gemini_cli", "claude_code", "openrouter", "gemini", or "anthropic"
+        provider: "auto", "qwen25vl", "gemini_cli", "claude_code", "openrouter", "gemini", or "anthropic"
 
     Returns:
         ReceiptData with extracted information.
 
     Provider priority (auto mode):
-        Claude Code CLI (sonnet) → Gemini CLI → OpenRouter → Gemini API → Anthropic API
+        Server mode: Qwen2.5-VL → Claude Code CLI (sonnet) → Gemini CLI → Gemini API → Anthropic API
+        Local mode:  Claude Code CLI (sonnet) → Gemini CLI → OpenRouter → Gemini API → Anthropic API
     """
     import os
 
     if provider == "auto":
         providers = []
+        local_mode = os.environ.get("DOUZONE_LOCAL_MODE") == "1"
+
+        if QWEN25VL_AVAILABLE and not local_mode:
+            # Only try Qwen in server mode and if reachable
+            if _is_qwen_reachable():
+                providers.append("qwen25vl")
+            else:
+                logger.info("Qwen2.5-VL server not reachable, skipping")
 
         if CLAUDE_CODE_AVAILABLE:
             providers.append("claude_code")
@@ -1089,7 +1181,8 @@ async def extract_receipt(image_path: str, api_key: Optional[str] = None, provid
                 "  1. Install Claude Code CLI (recommended for local mode)\n"
                 "  2. Install Gemini CLI\n"
                 "  3. Set OPENROUTER_API_KEY environment variable\n"
-                "  4. Set GOOGLE_API_KEY or ANTHROPIC_API_KEY environment variable"
+                "  4. Ensure Qwen2.5-VL OCR API is reachable (server mode)\n"
+                "  5. Set GOOGLE_API_KEY or ANTHROPIC_API_KEY environment variable"
             )
 
         last_error = None
@@ -1102,7 +1195,9 @@ async def extract_receipt(image_path: str, api_key: Optional[str] = None, provid
         if last_error:
             raise last_error
 
-    if provider == "gemini_cli":
+    if provider == "qwen25vl":
+        extractor = QwenReceiptExtractor()
+    elif provider == "gemini_cli":
         extractor = GeminiCliReceiptExtractor()
     elif provider == "claude_code":
         extractor = ClaudeCodeReceiptExtractor()

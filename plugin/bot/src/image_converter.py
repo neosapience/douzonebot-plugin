@@ -35,6 +35,11 @@ def is_heic_file(path: str) -> bool:
     return Path(path).suffix.lower() in {'.heic', '.heif'}
 
 
+def is_pdf_file(path: str) -> bool:
+    """Check if a file is PDF format."""
+    return Path(path).suffix.lower() == '.pdf'
+
+
 def is_supported_image(path: str) -> bool:
     """Check if a file is a supported image format."""
     return Path(path).suffix.lower() in SUPPORTED_INPUT_FORMATS

@@ -26,7 +26,7 @@ from .automation import DouzoneAutomation
 from .transaction_parser import TransactionParser, Transaction, TransactionList
 from .pipeline import parse_memo, MemoData
 from .ocr import extract_receipt, extract_receipt_from_text, find_preocr_file, ReceiptData, CLAUDE_CODE_AVAILABLE
-from .image_converter import convert_image, is_heic_file
+from .image_converter import convert_image, is_heic_file, is_pdf_file
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +34,7 @@ STAGE1_CACHE_VERSION = 1
 DEFAULT_STAGE1_CACHE_PATH = os.path.join("cache", "stage1_cache.json")
 DEFAULT_STAGE1_REPORT_DIR = "reports"
 DEFAULT_STAGE3_CACHE_PATH = os.path.join("cache", "execution_plan.json")
-RECEIPT_OCR_MAX_WORKERS = 3 if sys.platform == "win32" else 10
+RECEIPT_OCR_MAX_WORKERS = 10
 
 # ============================================================================
 # PURPOSE CODE MAPPING (from Douzone 용도 코드)
@@ -124,6 +124,36 @@ SAAS_MERCHANTS = [
     'subscription', '구독',
 ]
 
+# SaaS merchant → receipt vendor keyword mapping (for FX invoice matching)
+# Card merchant keywords → possible receipt vendor keywords
+SAAS_VENDOR_MAP = {
+    'cursor': ['anysphere', 'cursor'],
+    'claude': ['anthropic', 'claude'],
+    'anthropic': ['anthropic'],
+    'openai': ['openai'],
+    'chatgpt': ['openai'],
+    'github': ['github'],
+    'copilot': ['github', 'copilot'],
+    'notion': ['notion'],
+    'slack': ['slack', 'salesforce'],
+    'figma': ['figma'],
+    'linear': ['linear'],
+    'vercel': ['vercel'],
+    'aws': ['amazon web services', 'aws'],
+    'azure': ['microsoft', 'azure'],
+    'gcp': ['google cloud', 'google'],
+    'google cloud': ['google cloud', 'google'],
+    'dropbox': ['dropbox'],
+    'zoom': ['zoom'],
+    'adobe': ['adobe'],
+    'canva': ['canva'],
+    'deepl': ['deepl'],
+}
+
+# Plausible KRW/USD exchange rate range for FX amount matching
+FX_RATE_MIN = 1100
+FX_RATE_MAX = 1600
+
 # Large malls/department stores that require receipt attachment
 RECEIPT_REQUIRED_MERCHANTS = [
     '스타필드', '코엑스', '현대백화점', '롯데백화점', '신세계백화점',
@@ -146,10 +176,10 @@ class MatchedRow:
     memo_source: Optional[str] = None  # Which memo line matched
     matched_memo: Optional[Dict[str, Any]] = None  # MatchResult as dict
 
-    receipt_path: Optional[str] = None
+    receipt_paths: List[str] = field(default_factory=list)  # Multiple receipts per row
     supplier_name: Optional[str] = None
     supplier_biz_no: Optional[str] = None
-    matched_receipt: Optional[Dict[str, Any]] = None  # MatchResult as dict
+    matched_receipts: List[Dict[str, Any]] = field(default_factory=list)  # MatchResults as dicts
 
     # 용도/내용 handling (Stage 2 determines these)
     needs_yongdo: bool = False  # True if 용도 column is empty and needs filling
@@ -187,7 +217,7 @@ class MatchedRow:
             attendees=self.attendees,
             supplier_name=self.supplier_name,
             supplier_biz_no=self.supplier_biz_no,
-            receipt_path=self.receipt_path,
+            receipt_paths=self.receipt_paths,
             pending_reason=self.pending_reason,
             needs_yongdo=self.needs_yongdo,
             needs_content=self.needs_content,
@@ -219,7 +249,7 @@ class ProcessingPlan:
     
     @property
     def with_receipt_count(self) -> int:
-        return sum(1 for r in self.rows if r.receipt_path)
+        return sum(1 for r in self.rows if r.receipt_paths)
     
     @property
     def pending_receipt_count(self) -> int:
@@ -246,7 +276,7 @@ class MVPOrchestrator:
         user_name: str,
         memo_path: Optional[str] = None,
         receipts_path: Optional[str] = None,
-        cdp_url: str = "http://localhost:9444",
+        cdp_url: str = "http://localhost:9222",
         auto_approve: bool = False,
         stage1_cache_in: Optional[str] = None,
         stage1_cache_out: Optional[str] = None,
@@ -326,15 +356,10 @@ class MVPOrchestrator:
     async def collect_data(self, skip_transactions: bool = False) -> None:
         """
         Collect all data from Douzone, memos, and receipts.
-
+        
         Args:
             skip_transactions: If True, skip Douzone parsing (for testing)
         """
-        # When Stage 2 cache will be loaded, skip data collection entirely
-        if self.stage2_cache_in:
-            print("\n📥 STAGE 1: Data Collection — skipped (Stage 2 cache will be loaded)")
-            return
-
         print("\n" + "="*60)
         print("📥 STAGE 1: Data Collection")
         print("="*60)
@@ -572,9 +597,6 @@ class MVPOrchestrator:
             best_score = 0
 
             for row in self.plan.rows:
-                if row.receipt_path:
-                    continue  # Already has a receipt
-
                 tx = row.transaction
                 tx_date = tx.date_time.split(' ')[0] if ' ' in tx.date_time else tx.date_time
                 tx_time = tx.date_time.split(' ')[1][:5] if ' ' in tx.date_time else ""
@@ -605,14 +627,16 @@ class MVPOrchestrator:
 
             if best_row and best_score >= 2:
                 receipt_name = Path(receipt.source_path or path).name
-                best_row.receipt_path = path
-                best_row.matched_receipt = {
+                if path in best_row.receipt_paths:
+                    continue  # Avoid duplicate receipt
+                best_row.receipt_paths.append(path)
+                best_row.matched_receipts.append({
                     "item_id": f"receipt_{receipt_name}",
                     "item_type": "receipt",
                     "matched_row": best_row.row_index,
                     "confidence": 1.0 if best_score == 3 else 0.8,
                     "reason": f"Progressive match: score {best_score}"
-                }
+                })
 
                 if receipt.vendor_info and self._is_pg_merchant(best_row.transaction.merchant):
                     best_row.supplier_name = receipt.vendor_info.name
@@ -630,12 +654,33 @@ class MVPOrchestrator:
                     best_row.clarification_reason = None
 
                 matched_count += 1
+                n_receipts = len(best_row.receipt_paths)
+                suffix = f" ({n_receipts} files)" if n_receipts > 1 else ""
                 print(f"   ✅ Receipt → Row {best_row.row_index+1}: "
-                      f"{best_row.transaction.merchant} ({receipt_name})")
+                      f"{best_row.transaction.merchant} ({receipt_name}){suffix}")
+
+        # SaaS matching pass: match unmatched receipts to unmatched SaaS rows
+        # using merchant name mapping, FX-plausible amounts, and filename hints
+        matched_receipt_paths = set()
+        for row in self.plan.rows:
+            matched_receipt_paths.update(row.receipt_paths)
+
+        unmatched_saas_rows = [
+            row for row in self.plan.rows
+            if not row.receipt_paths and self._is_saas_merchant(row.transaction.merchant)
+        ]
+        unmatched_receipts = [
+            (path, receipt) for path, receipt in self.receipts.items()
+            if path not in matched_receipt_paths
+        ]
+
+        if unmatched_saas_rows and unmatched_receipts:
+            saas_matched = self._match_saas_receipts(unmatched_saas_rows, unmatched_receipts)
+            matched_count += saas_matched
 
         # Any remaining PG merchants without receipt → flag
         for row in self.plan.rows:
-            if (row.pending_receipt and not row.receipt_path
+            if (row.pending_receipt and not row.receipt_paths
                     and self._is_pg_merchant(row.transaction.merchant)):
                 row.pending_reason = "영수증 미첨부"
                 if not row.needs_clarification:
@@ -712,7 +757,8 @@ class MVPOrchestrator:
     async def _parse_memos(self) -> None:
         """Parse memos from memo.txt file using batch processing."""
         if not self.memo_path or not os.path.exists(self.memo_path):
-            print(f"   ⚠️  No memo file found at: {self.memo_path}")
+            if not self.stage2_cache_in:
+                print(f"   ⚠️  No memo file found at: {self.memo_path}")
             return
         
         with open(self.memo_path, 'r', encoding='utf-8') as f:
@@ -735,19 +781,24 @@ class MVPOrchestrator:
     async def _parse_receipts(self) -> None:
         """Parse receipts from receipts folder (with optional caching)."""
         if not self.receipts_path or not os.path.exists(self.receipts_path):
-            print(f"   ⚠️  No receipts folder found at: {self.receipts_path}")
+            if not self.stage2_cache_in:
+                print(f"   ⚠️  No receipts folder found at: {self.receipts_path}")
             return
 
-        # Find all image files, deduplicating heic/jpg pairs by stem
-        image_extensions = {'.jpg', '.jpeg', '.png', '.heic'}
-        files_by_stem: dict[str, str] = {}  # stem -> best path
+        # Find all receipt files, deduplicating heic/jpg pairs by stem
+        receipt_extensions = {'.jpg', '.jpeg', '.png', '.heic', '.pdf'}
+        files_by_stem: dict[str, str] = {}  # stem -> best path (for image dedup)
+        pdf_files: list[str] = []  # PDF files skip stem dedup
 
         for f in sorted(os.listdir(self.receipts_path)):
             ext = os.path.splitext(f)[1].lower()
-            if ext not in image_extensions:
+            if ext not in receipt_extensions:
                 continue
             full_path = os.path.join(self.receipts_path, f)
             if not os.path.isfile(full_path):
+                continue
+            if ext == '.pdf':
+                pdf_files.append(full_path)
                 continue
             stem = os.path.splitext(f)[0].lower()
             if stem in files_by_stem:
@@ -759,8 +810,8 @@ class MVPOrchestrator:
             else:
                 files_by_stem[stem] = full_path
 
-        receipt_files = sorted(files_by_stem.values())
-        print(f"   Found {len(receipt_files)} receipt images")
+        receipt_files = sorted(files_by_stem.values()) + sorted(pdf_files)
+        print(f"   Found {len(receipt_files)} receipt files")
 
         if not receipt_files:
             return
@@ -1288,7 +1339,7 @@ class MVPOrchestrator:
             "attendees": expense.attendees,
             "supplier_name": expense.supplier_name,
             "supplier_biz_no": expense.supplier_biz_no,
-            "receipt_path": expense.receipt_path,
+            "receipt_paths": expense.receipt_paths,
             "pending_reason": expense.pending_reason,
             "needs_yongdo": expense.needs_yongdo,
             "needs_content": expense.needs_content,
@@ -1320,10 +1371,10 @@ class MVPOrchestrator:
                 attendees=row_dict["attendees"],
                 memo_source=row_dict.get("memo_source"),
                 matched_memo=row_dict.get("matched_memo"),
-                receipt_path=row_dict.get("receipt_path"),
+                receipt_paths=row_dict.get("receipt_paths") or ([row_dict["receipt_path"]] if row_dict.get("receipt_path") else []),
                 supplier_name=row_dict.get("supplier_name"),
                 supplier_biz_no=row_dict.get("supplier_biz_no"),
-                matched_receipt=row_dict.get("matched_receipt"),
+                matched_receipts=row_dict.get("matched_receipts") or ([row_dict["matched_receipt"]] if row_dict.get("matched_receipt") else []),
                 needs_yongdo=row_dict.get("needs_yongdo", False),
                 target_yongdo=row_dict.get("target_yongdo"),
                 needs_content=row_dict.get("needs_content", False),
@@ -1364,6 +1415,52 @@ class MVPOrchestrator:
         print(f"   Loaded {len(self.plan.rows)} rows")
         print(f"   High confidence: {self.plan.high_confidence_count}")
         print(f"   Needs clarification: {self.plan.needs_clarification_count}")
+
+    def _ensure_receipt_files_exist(self) -> None:
+        """Validate receipt file paths in the plan and re-convert HEIC if needed.
+
+        When loading from cache, converted HEIC→JPG files may not exist
+        (e.g., temp directory was cleaned). This method re-converts them.
+        """
+        if not self.plan:
+            return
+
+        reconverted = 0
+        for row in self.plan.rows:
+            fixed_paths = []
+            for p in row.receipt_paths:
+                if os.path.exists(p):
+                    fixed_paths.append(p)
+                    continue
+
+                # Check if this is a converted path (e.g., .../converted/IMG_1234.jpg)
+                # and the original HEIC still exists
+                path_obj = Path(p)
+                if path_obj.parent.name == "converted":
+                    original_dir = path_obj.parent.parent
+                    stem = path_obj.stem
+                    for ext in [".heic", ".HEIC", ".heif", ".HEIF"]:
+                        original = original_dir / (stem + ext)
+                        if original.exists():
+                            try:
+                                converted_dir = str(path_obj.parent)
+                                os.makedirs(converted_dir, exist_ok=True)
+                                jpg_path = convert_image(str(original), converted_dir)
+                                fixed_paths.append(jpg_path)
+                                reconverted += 1
+                            except Exception as e:
+                                logger.warning(f"HEIC re-conversion failed for {original}: {e}")
+                                print(f"   ⚠️  HEIC re-conversion failed: {original} ({e})")
+                            break
+                    else:
+                        print(f"   ⚠️  Receipt file missing (no HEIC original found): {p}")
+                else:
+                    print(f"   ⚠️  Receipt file missing: {p}")
+
+            row.receipt_paths = fixed_paths
+
+        if reconverted:
+            print(f"   Re-converted {reconverted} HEIC file(s) for attachment")
 
     def _load_stage3_cache(self, cache_path: str) -> None:
         """Load Stage 3 reviewed plan from a JSON cache file (debug only)."""
@@ -1411,10 +1508,10 @@ class MVPOrchestrator:
                 "attendees": row.attendees,
                 "memo_source": row.memo_source,
                 "matched_memo": row.matched_memo,
-                "receipt_path": row.receipt_path,
+                "receipt_paths": row.receipt_paths,
                 "supplier_name": row.supplier_name,
                 "supplier_biz_no": row.supplier_biz_no,
-                "matched_receipt": row.matched_receipt,
+                "matched_receipts": row.matched_receipts,
                 "needs_yongdo": row.needs_yongdo,
                 "target_yongdo": row.target_yongdo,
                 "needs_content": row.needs_content,
@@ -1509,6 +1606,7 @@ class MVPOrchestrator:
         # Check if we should load from cache instead
         if self.stage2_cache_in:
             self._load_stage2_cache(self.stage2_cache_in)
+            self._ensure_receipt_files_exist()
             return self.plan
 
         if not self.transactions:
@@ -1573,9 +1671,9 @@ class MVPOrchestrator:
                 # No memo - use default user name
                 print(f"   Row {idx+1}: No memo, using default: {self.user_name}")
             
-            # Apply Receipt Match
+            # Apply Receipt Match (AI matching)
             if receipt_match:
-                row.matched_receipt = self._match_to_dict(receipt_match)
+                row.matched_receipts.append(self._match_to_dict(receipt_match))
                 # Find the actual receipt object using source_path
                 found_receipt = None
                 found_path = None
@@ -1588,22 +1686,22 @@ class MVPOrchestrator:
                         break
 
                 if found_receipt:
-                    row.receipt_path = found_path
+                    if found_path not in row.receipt_paths: row.receipt_paths.append(found_path)
                     if found_receipt.vendor_info and self._is_pg_merchant(tx.merchant):
                         row.supplier_name = found_receipt.vendor_info.name
                         row.supplier_biz_no = found_receipt.vendor_info.biz_num
                     print(f"   Row {idx+1}: Receipt matched ({receipt_match.confidence:.2f}) → {row.supplier_name or 'N/A'}")
             
-            # Handling PG Transactions / Missing Receipts
-            if not row.receipt_path and self._might_need_receipt(tx.merchant):
+            # Handling PG / SaaS Transactions — Missing Receipts
+            if not row.receipt_paths and self._might_need_receipt(tx.merchant):
                 row.pending_receipt = True
-                row.pending_reason = "영수증 미첨부"
-                # If we have a high confidence memo match, we might not need clarification just for missing receipt
-                # But typically missing receipt is worth flagging
+                is_saas = self._is_saas_merchant(tx.merchant)
+                row.pending_reason = "SaaS 구독 영수증 미첨부" if is_saas else "영수증 미첨부"
                 if not row.needs_clarification:
                      row.needs_clarification = True
                      row.confidence = "LOW"
-                     row.clarification_reason = f"No receipt for PG transaction"
+                     reason_type = "SaaS subscription" if is_saas else "PG transaction"
+                     row.clarification_reason = f"No receipt for {reason_type}"
                 print(f"   Row {idx+1}: ⚠️ No receipt for {tx.merchant}")
                 
             # Set confidence based on AI matches
@@ -1613,11 +1711,23 @@ class MVPOrchestrator:
                 row.needs_clarification = True
                 row.clarification_reason = f"AI low confidence match (Memo: {memo_match.confidence if memo_match else 'N/A'}, Receipt: {receipt_match.confidence if receipt_match else 'N/A'})"
 
+            # Get receipt time for more accurate meal classification
+            receipt_time = None
+            if row.receipt_paths:
+                for rpath in row.receipt_paths:
+                    r = self.receipts.get(rpath)
+                    if r and r.transaction and r.transaction.time:
+                        receipt_time = r.transaction.time
+                        break
+
             # Determine 용도 (purpose) if not already filled
             if not tx.yongdo_filled:
                 row.needs_yongdo = True
-                row.target_yongdo = self._determine_yongdo(tx)
-                print(f"   Row {idx+1}: 용도 empty → will fill '{row.target_yongdo}'")
+                row.target_yongdo = self._determine_yongdo(tx, receipt_time=receipt_time)
+                if receipt_time and receipt_time != tx.time:
+                    print(f"   Row {idx+1}: 용도 empty → will fill '{row.target_yongdo}' (using receipt time {receipt_time})")
+                else:
+                    print(f"   Row {idx+1}: 용도 empty → will fill '{row.target_yongdo}'")
 
             # Determine 내용 (content) if not already filled
             if not tx.content_filled:
@@ -1738,18 +1848,22 @@ class MVPOrchestrator:
         return self.plan
 
     def _might_need_receipt(self, merchant: str) -> bool:
-        """Check if a merchant might need receipt for 실공급자 info."""
-        return self._is_pg_merchant(merchant)
+        """Check if a merchant might need receipt attachment."""
+        return self._is_pg_merchant(merchant) or self._is_saas_merchant(merchant)
 
-    def _determine_yongdo(self, tx: Transaction) -> str:
+    def _determine_yongdo(self, tx: Transaction, receipt_time: Optional[str] = None) -> str:
         """
         Determine appropriate 용도 (purpose) for a transaction.
 
         Logic:
         1. Check SaaS/software keywords → 소프트웨어구독료
         2. Check snack/coffee keywords → 간식/음료
-        3. Check time of day for meals
+        3. Check time of day for meals (receipt time preferred over transaction time)
         4. Default to 중식대 for unclassified
+
+        Args:
+            tx: Transaction data
+            receipt_time: Optional time from matched receipt (HH:MM:SS or HH:MM), preferred over tx.time
 
         Returns:
             용도 name (e.g., "중식대", "간식/음료", "소프트웨어구독료")
@@ -1764,9 +1878,9 @@ class MVPOrchestrator:
         if any(kw.lower() in merchant_lower for kw in SNACK_MERCHANTS):
             return "간식/음료"
 
-        # Try to determine by time of day
+        # Try to determine by time of day (receipt time > transaction time)
         try:
-            time_str = tx.time  # "HH:MM"
+            time_str = receipt_time or tx.time  # Prefer receipt time
             if time_str:
                 hour = int(time_str.split(':')[0])
 
@@ -1816,6 +1930,119 @@ class MVPOrchestrator:
         merchant_lower = merchant.lower()
         return any(kw.lower() in merchant_lower for kw in PG_MERCHANTS)
 
+    def _is_saas_merchant(self, merchant: str) -> bool:
+        """Check if merchant is a SaaS/software subscription."""
+        merchant_lower = merchant.lower()
+        return any(kw.lower() in merchant_lower for kw in SAAS_MERCHANTS)
+
+    def _match_saas_receipts(
+        self,
+        saas_rows: list,
+        unmatched_receipts: list,
+    ) -> int:
+        """
+        Match SaaS receipts using merchant name mapping, FX amount, and filename hints.
+
+        Scoring:
+          - Merchant name match (via SAAS_VENDOR_MAP or filename): +2
+          - FX-plausible amount (KRW/foreign ratio in range): +1
+          - Date within 35 days (billing cycle): +1
+          - Require score >= 2 to match
+
+        Returns:
+            Number of newly matched receipts.
+        """
+        from datetime import datetime, timedelta
+
+        matched = 0
+
+        for path, receipt in unmatched_receipts:
+            receipt_vendor = (receipt.vendor_info.name or "").lower() if receipt.vendor_info else ""
+            receipt_filename = os.path.basename(path).lower()
+            receipt_amount = receipt.transaction.amount if receipt.transaction else None
+            receipt_date_str = receipt.transaction.date if receipt.transaction else None
+
+            best_row = None
+            best_score = 0
+
+            for row in saas_rows:
+                if path in row.receipt_paths:
+                    continue
+
+                tx = row.transaction
+                merchant_lower = tx.merchant.lower()
+                score = 0
+
+                # 1. Merchant name match via SAAS_VENDOR_MAP
+                name_matched = False
+                for saas_kw, vendor_keywords in SAAS_VENDOR_MAP.items():
+                    if saas_kw in merchant_lower:
+                        if any(vk in receipt_vendor for vk in vendor_keywords):
+                            name_matched = True
+                            break
+                        # Also check filename for vendor keywords
+                        if any(vk in receipt_filename for vk in vendor_keywords):
+                            name_matched = True
+                            break
+
+                # 2. Filename hint: check if filename contains any SaaS merchant keyword
+                if not name_matched:
+                    for saas_kw in SAAS_VENDOR_MAP:
+                        if saas_kw in merchant_lower and saas_kw in receipt_filename:
+                            name_matched = True
+                            break
+
+                if name_matched:
+                    score += 2
+
+                # 3. FX-plausible amount
+                if receipt_amount and receipt_amount > 0 and tx.amount > 0:
+                    ratio = tx.amount / receipt_amount
+                    if FX_RATE_MIN <= ratio <= FX_RATE_MAX:
+                        score += 1
+
+                # 4. Date within 35 days
+                if receipt_date_str:
+                    try:
+                        tx_date_str = tx.date_time.split(' ')[0] if ' ' in tx.date_time else tx.date_time
+                        receipt_dt = datetime.strptime(receipt_date_str, "%Y-%m-%d")
+                        tx_dt = datetime.strptime(tx_date_str, "%Y-%m-%d")
+                        if abs((tx_dt - receipt_dt).days) <= 35:
+                            score += 1
+                    except (ValueError, TypeError):
+                        pass
+
+                if score > best_score:
+                    best_score = score
+                    best_row = row
+
+            if best_row and best_score >= 2:
+                receipt_name = Path(receipt.source_path or path).name
+                best_row.receipt_paths.append(path)
+                best_row.matched_receipts.append({
+                    "item_id": f"receipt_{receipt_name}",
+                    "item_type": "receipt",
+                    "matched_row": best_row.row_index,
+                    "confidence": 0.7 if best_score >= 3 else 0.6,
+                    "reason": f"SaaS match: score {best_score}"
+                })
+
+                best_row.pending_receipt = False
+                best_row.pending_reason = None
+
+                if (best_row.needs_clarification and
+                        best_row.clarification_reason and
+                        "No receipt" in best_row.clarification_reason):
+                    best_row.needs_clarification = False
+                    best_row.confidence = "HIGH"
+                    best_row.clarification_reason = None
+
+                matched += 1
+                print(f"   ✅ SaaS Receipt → Row {best_row.row_index+1}: "
+                      f"{best_row.transaction.merchant} ({receipt_name}, score={best_score})")
+
+        return matched
+
     def _requires_receipt_attachment(self, merchant: str) -> bool:
         """Check if merchant requires physical receipt attachment (백화점/코엑스 등)."""
         merchant_lower = merchant.lower()
@@ -1855,7 +2082,7 @@ class MVPOrchestrator:
             row_action = RowAction(
                 row_number=tx.row_num,
                 transaction=transaction_dict,
-                matched_receipt=row.matched_receipt,
+                matched_receipts=row.matched_receipts,
                 matched_memo=row.matched_memo,
                 action=action,
                 fill_data=fill_data,
@@ -2144,8 +2371,9 @@ class MVPOrchestrator:
         if row.supplier_name:
             print(f"      실공급자: {row.supplier_name} / {row.supplier_biz_no or 'N/A'}")
 
-        if row.receipt_path:
-            print(f"      첨부: {os.path.basename(row.receipt_path)} ✅")
+        if row.receipt_paths:
+            names = [os.path.basename(p) for p in row.receipt_paths]
+            print(f"      첨부: {', '.join(names)} ✅")
         elif row.pending_receipt:
             print(f"      첨부: ❌ 영수증 없음")
 
@@ -2166,15 +2394,6 @@ class MVPOrchestrator:
                 print(f"      ⚠️ Needs clarification: {row.clarification_reason}")
             else:
                 print(f"      ⚠️ Needs clarification")
-            return
-
-        # Auto-approve: resolve with defaults, skip interactive prompts
-        if self.auto_approve:
-            if row.pending_receipt:
-                row.pending_reason = "영수증 미첨부"
-            row.needs_clarification = False
-            row.confidence = "HIGH"
-            row.user_confirmed = True
             return
 
         try:
@@ -2246,7 +2465,7 @@ class MVPOrchestrator:
             attendees=fd.get("attendees", ""),
             supplier_name=fd.get("supplier_name"),
             supplier_biz_no=fd.get("supplier_biz_no"),
-            receipt_path=fd.get("receipt_path"),
+            receipt_paths=fd.get("receipt_paths") or ([fd["receipt_path"]] if fd.get("receipt_path") else []),
             pending_reason=fd.get("pending_reason"),
             needs_yongdo=bool(needs_yongdo),
             needs_content=bool(needs_content),
@@ -2386,9 +2605,8 @@ class MVPOrchestrator:
             bar = "█" * filled + "░" * (bar_len - filled)
             
             merchant = (row.transaction or {}).get("merchant", "") if row.transaction else ""
-            # Write progress to stderr so it survives quiet mode (which suppresses print/stdout)
-            sys.stderr.write(f"\r🔄 [{bar}] {progress:.0f}% - Row {row_number}/{total}: {merchant[:15]}...")
-            sys.stderr.flush()
+            print(f"\r🔄 [{bar}] {progress:.0f}% - Row {row_number}/{total}: {merchant[:15]}...", 
+                  end="", flush=True)
 
             row.execution_status = ExecutionStatus.PROCESSING.value
             row.execution_timestamp = datetime.now().isoformat()
@@ -2429,7 +2647,7 @@ class MVPOrchestrator:
                 with open(self.execution_plan_path, "w", encoding="utf-8") as f:
                     json.dump(plan.to_dict(), f, ensure_ascii=False, indent=2)
         
-        sys.stderr.write("\n")  # New line after progress bar
+        print()  # New line after progress bar
 
         # Close any leftover popup/dialog from the last row
         try:
@@ -2444,22 +2662,20 @@ class MVPOrchestrator:
         
         # Results summary
         plan_total = plan.rows_to_process
-        # Final results go to stderr so they survive quiet mode
-        _eprint = lambda msg="": sys.stderr.write(msg + "\n")
-        _eprint(f"\n{'─'*40}")
-        _eprint("📊 Automation Results:")
-        _eprint(f"   Total: {plan_total}")
-        _eprint(f"   Success: {plan.stage4_success_count}")
-        _eprint(f"   Failed: {plan.stage4_failed_count}")
-        _eprint(f"   Skipped: {plan.stage4_skipped_count}")
-        _eprint(f"   Success rate: {plan.success_rate:.1f}%")
-
+        print(f"\n{'─'*40}")
+        print("📊 Automation Results:")
+        print(f"   Total: {plan_total}")
+        print(f"   Success: {plan.stage4_success_count}")
+        print(f"   Failed: {plan.stage4_failed_count}")
+        print(f"   Skipped: {plan.stage4_skipped_count}")
+        print(f"   Success rate: {plan.success_rate:.1f}%")
+        
         if failures:
-            _eprint(f"\n⚠️ Failures:")
+            print(f"\n⚠️ Failures:")
             for f in failures[:10]:  # Show first 10
-                _eprint(f"   - {f}")
+                print(f"   - {f}")
             if len(failures) > 10:
-                _eprint(f"   ... and {len(failures) - 10} more")
+                print(f"   ... and {len(failures) - 10} more")
         
         return {
             "total": plan_total,
@@ -2498,12 +2714,12 @@ class MVPOrchestrator:
                     print("\n⚠️ Test mode: Skipping actual automation")
                     return {"test_mode": True, "execution_plan": self.execution_plan}
                 result = await self.execute()
-                sys.stderr.write("\n" + "="*60 + "\n")
+                print("\n" + "="*60)
                 if result["success"] == result["total"]:
-                    sys.stderr.write("🎉 ALL DONE! Expense claim automation complete.\n")
+                    print("🎉 ALL DONE! Expense claim automation complete.")
                 else:
-                    sys.stderr.write("⚠️ Completed with some failures. Check logs.\n")
-                sys.stderr.write("="*60 + "\n")
+                    print("⚠️ Completed with some failures. Check logs.")
+                print("="*60)
                 return result
 
             # Stage 1: Collect data
@@ -2513,7 +2729,7 @@ class MVPOrchestrator:
                 print("\nStage 1 only mode: stopping after data collection.")
                 return {"stage1_only": True}
             
-            if not skip_transactions and not self.transactions and not self.stage2_cache_in:
+            if not skip_transactions and not self.transactions:
                 print("\n❌ No transactions found. Aborting.")
                 return {"error": "No transactions found"}
             
@@ -2530,7 +2746,7 @@ class MVPOrchestrator:
                 high = sum(1 for r in (self.plan.rows if self.plan else []) if r.confidence == "HIGH")
                 low = sum(1 for r in (self.plan.rows if self.plan else []) if r.confidence == "LOW")
                 needs_clarify = sum(1 for r in (self.plan.rows if self.plan else []) if r.needs_clarification)
-                has_receipt = sum(1 for r in (self.plan.rows if self.plan else []) if r.receipt_path)
+                has_receipt = sum(1 for r in (self.plan.rows if self.plan else []) if r.receipt_paths)
                 sys.stderr.write(f"\nSTAGE2_OK=true\n")
                 sys.stderr.write(f"STAGE2_TOTAL={total}\n")
                 sys.stderr.write(f"STAGE2_HIGH={high}\n")
@@ -2591,7 +2807,7 @@ class MVPOrchestrator:
         user_name: str,
         memo_path: Optional[str] = None,
         receipts_path: Optional[str] = None,
-        cdp_url: str = "http://localhost:9444"
+        cdp_url: str = "http://localhost:9222"
     ) -> ProcessingPlan:
         """
         Run Stage 1 and Stage 2 and return the processing plan.
@@ -2612,7 +2828,7 @@ class MVPOrchestrator:
     async def run_automation_single_row(
         self,
         row: Any,  # MatchedRow or similar
-        cdp_url: str = "http://localhost:9444"
+        cdp_url: str = "http://localhost:9222"
     ) -> bool:
         """
         Execute automation for a single row.
@@ -2681,7 +2897,7 @@ async def run_mvp(
     user_name: str,
     memo_path: Optional[str] = None,
     receipts_path: Optional[str] = None,
-    cdp_url: str = "http://localhost:9444",
+    cdp_url: str = "http://localhost:9222",
     test_mode: bool = False,
     auto_approve: bool = False,
     stage1_cache_in: Optional[str] = None,
@@ -2725,6 +2941,7 @@ async def run_mvp(
         stage3_cache_in: Load Stage 3 reviewed plan from this path (debug only)
         stage3_cache_out: Save Stage 3 reviewed plan to this path (debug only)
         stage3_only: Stop after Stage 3 review (debug only)
+        review_only: Display review without prompts or execution
 
     Returns:
         Result dictionary

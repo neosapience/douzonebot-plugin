@@ -14,7 +14,7 @@ allowed-tools: Bash, Read, Write, Edit, Glob, Grep, WebFetch, AskUserQuestion
 
 ## 경로 규칙
 
-- **BOT_DIR**: 이 SKILL.md 파일에서 2단계 상위 디렉토리의 `bot/` 폴더 (플러그인에 내장된 봇 코드)
+- **BOT_DIR**: 이 SKILL.md 파일의 grandparent 디렉토리 아래 `bot/` 폴더. 예: `plugin/skills/<skill>/SKILL.md` → `plugin/skills/` → `plugin/` → `plugin/bot/`
 - **DATA_DIR**: `~/douzone-bot/` (사용자 설정 파일 — config.yaml만 저장)
 
 모든 `uv run` 명령은 BOT_DIR에서 실행합니다.
@@ -149,7 +149,7 @@ export PATH="$HOME/.local/bin:$USERPROFILE/.local/bin:$PATH" PYTHONIOENCODING=ut
 사용자에게 다음 단계를 안내합니다:
 1. Claude Code에서 `/plugin` 입력
 2. **Marketplaces** 탭 선택
-3. `neosapience-douzonebot-plugin` 마켓플레이스 선택
+3. `neosapience-douzone-bot` 마켓플레이스 선택
 4. **Enable auto-update** 클릭
 
 > 이 설정은 한 번만 하면 됩니다. 이후에는 Claude Code 세션 시작 시 자동으로 최신 버전을 받습니다.

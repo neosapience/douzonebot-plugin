@@ -41,7 +41,7 @@ Extract:
 
 STRICT RULES FOR attendees:
 - Attendees are ONLY person names.
-- Names are typically 3 Hangul characters (allow 2–4). Keep only pure Hangul tokens.
+- Names are typically 2–3 Hangul characters (allow 2–4). Keep only pure Hangul tokens.
 - EXCLUDE any non-name words such as:
   점심, 저녁, 아침, 회식, 회의, 미팅, 커피, 간식, 식사, 디저트, 팀, 업무, 프로젝트,
   매니저, 리더, 파트, TF, 본부, 센터, 실, 부, 과
@@ -242,7 +242,7 @@ async def parse_memos_batch(memos_text: str, provider: "LLMProvider" = None) -> 
     prompt = MEMO_BATCH_PARSE_PROMPT.format(memos_text=memos_text)
 
     try:
-        response_text = await provider.complete(prompt, timeout=120)
+        response_text = await provider.complete(prompt, timeout=60)
         return _parse_batch_memo_response(response_text)
     except Exception as e:
         logger.error(f"Failed to batch parse memos via {provider.name}: {e}")
@@ -587,7 +587,6 @@ async def _match_single_batch_optimized(
 
         # Parse the matches
         matches_data = _parse_json_response(response_text)
-        logger.debug(f"Parsed matches_data type: {type(matches_data)}, len: {len(matches_data) if isinstance(matches_data, (list, dict)) else 0}")
 
         if isinstance(matches_data, dict):
             matches_data = matches_data.get("matches", [])
@@ -772,8 +771,6 @@ async def match_items_to_transactions(
                 continue
 
             logger.info(f"Batch {i} returned {len(result)} matches")
-            for match in result:
-                logger.debug(f"  {match.item_type} {match.item_id}: row={match.matched_row}, conf={match.confidence:.2f}")
             all_results.extend(result)
 
         logger.info(f"Total aggregated matches: {len(all_results)} (exact_matches={len(exact_matches)} + batches)")
@@ -818,7 +815,7 @@ async def match_items_to_transactions(
                 logger.error(f"No LLM provider available for matching date {date_key}")
                 continue
 
-            response_text = await provider.complete(prompt, timeout=120)
+            response_text = await provider.complete(prompt, timeout=60)
 
             # Parse the matches
             matches_data = _parse_json_response(response_text)
@@ -935,9 +932,9 @@ async def process_receipt_for_expense(
         attendees=attendees,
         supplier_name=supplier_name,
         supplier_biz_no=supplier_biz_no,
-        receipt_path=receipt_path,
+        receipt_paths=[receipt_path],
     )
-    
+
     return expense
 
 
@@ -961,7 +958,7 @@ async def enrich_expense_with_receipt(
     
     expense.supplier_name = supplier_name
     expense.supplier_biz_no = supplier_biz_no
-    expense.receipt_path = receipt_path
+    expense.receipt_paths = [receipt_path]
     
     return expense
 
@@ -1032,3 +1029,5 @@ async def process_receipts_batch(
 def is_ocr_available() -> bool:
     """Check if OCR capabilities are available."""
     return CLAUDE_CODE_AVAILABLE
+
+

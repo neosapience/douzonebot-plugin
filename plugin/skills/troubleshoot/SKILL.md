@@ -15,7 +15,7 @@ argument-hint: "[error_message_or_symptom]"
 
 ## 경로 규칙
 
-- **BOT_DIR**: 이 SKILL.md 파일에서 2단계 상위 디렉토리의 `bot/` 폴더 (플러그인에 내장된 봇 코드)
+- **BOT_DIR**: 이 SKILL.md 파일의 grandparent 디렉토리 아래 `bot/` 폴더. 예: `plugin/skills/<skill>/SKILL.md` → `plugin/skills/` → `plugin/` → `plugin/bot/`
 - **DATA_DIR**: `~/douzone-bot/` (사용자 설정 파일 — config.yaml)
 
 모든 `uv run` 명령은 BOT_DIR에서 실행합니다.

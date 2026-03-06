@@ -26,7 +26,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Supported image extensions for receipt scanning
-IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.heic', '.heif', '.bmp', '.tiff', '.tif'}
+IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.heic', '.heif', '.bmp', '.tiff', '.tif', '.pdf'}
 
 _config: AppConfig = None
 _provider: LLMProvider = None

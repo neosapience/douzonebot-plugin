@@ -556,7 +556,7 @@
                         <div class="drop-text">영수증 이미지를 여기에 끌어다 놓으세요</div>
                         <div class="drop-btn">또는 파일 선택</div>
                     </div>
-                    <input type="file" name="receipt_files" id="file-input" multiple accept=".jpg,.jpeg,.png,.heic,.heif,.bmp,.tiff,.tif,.md,.txt,.json" style="display:none;">
+                    <input type="file" name="receipt_files" id="file-input" multiple accept=".jpg,.jpeg,.png,.heic,.heif,.bmp,.tiff,.tif,.pdf,.md,.txt,.json" style="display:none;">
                     <div class="file-list" id="file-list"></div>
                 </div>
 
@@ -906,7 +906,7 @@
     }
 
     function addDroppedFiles(files) {
-        const imageExts = ['.jpg', '.jpeg', '.png', '.heic', '.heif', '.bmp', '.tiff', '.tif'];
+        const imageExts = ['.jpg', '.jpeg', '.png', '.heic', '.heif', '.bmp', '.tiff', '.tif', '.pdf'];
         const ocrExts = ['.ocr.md', '.ocr.txt', '.ocr.json'];
         const valid = files.filter(f => {
             const name = f.name.toLowerCase();

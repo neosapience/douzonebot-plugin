@@ -191,6 +191,7 @@ def launch_chrome(auto_port=True):
         f"--remote-debugging-port={port}",
         f"--user-data-dir={profile_dir}",
         "--remote-allow-origins=*",
+        "--start-maximized",
         douzone_url,
     ]
 
@@ -261,7 +262,7 @@ def launch_flask_server(port=None):
     proc = subprocess.Popen(
         [sys.executable, server_script, "--port", str(port)],
         stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
     )
 
     if wait_for_port(port, timeout=15):
@@ -270,6 +271,9 @@ def launch_flask_server(port=None):
         return proc, port
     else:
         print(f"[-] Dashboard server did not start within timeout.")
+        stderr_output = proc.stderr.read().decode(errors="replace").strip()
+        if stderr_output:
+            print(f"[-] Server error output:\n{stderr_output}")
         proc.terminate()
         return None, port
 
@@ -327,6 +331,8 @@ def cli():
     parser = argparse.ArgumentParser(description="Douzone Bot Launcher")
     parser.add_argument("--chrome", action="store_true",
                         help="Launch automation Chrome (auto port detection)")
+    parser.add_argument("--force-restart", action="store_true",
+                        help="Kill existing Chrome/dashboard before relaunching")
     parser.add_argument("--dashboard", action="store_true",
                         help="Launch dashboard server (auto port detection)")
     parser.add_argument("--find-port", type=int, metavar="START",
@@ -345,6 +351,25 @@ def cli():
         return
 
     if args.chrome:
+        if args.force_restart:
+            port = args.port or get_chrome_debug_port()
+            print(f"[+] Force-restarting: killing Chrome on port {port}...")
+            import signal
+            # Find and kill Chrome using the debug port
+            try:
+                if platform.system() == "Darwin":
+                    subprocess.run(["pkill", "-f", f"--remote-debugging-port={port}"],
+                                   capture_output=True, timeout=5)
+                elif platform.system() == "Windows":
+                    subprocess.run(["taskkill", "/F", "/FI",
+                                    f"COMMANDLINE eq *--remote-debugging-port={port}*"],
+                                   capture_output=True, timeout=5)
+                else:
+                    subprocess.run(["pkill", "-f", f"--remote-debugging-port={port}"],
+                                   capture_output=True, timeout=5)
+                time.sleep(1)
+            except Exception as e:
+                print(f"[!] Kill attempt: {e}")
         if args.port:
             update_config_port("chrome_debug_port", args.port)
         ok = launch_chrome(auto_port=True)

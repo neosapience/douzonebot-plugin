@@ -82,8 +82,8 @@ class ExpenseData:
     supplier_name: Optional[str] = None  # 실공급자상호
     supplier_biz_no: Optional[str] = None  # 실공급자 사업자등록번호
 
-    # Optional: for receipt upload
-    receipt_path: Optional[str] = None  # Path to receipt image file
+    # Optional: for receipt upload (supports multiple receipts per transaction)
+    receipt_paths: List[str] = field(default_factory=list)
 
     # Optional: for pending receipts (when receipt is missing)
     pending_reason: Optional[str] = None  # Reason for missing receipt (e.g., "영수증 분실")
@@ -99,9 +99,9 @@ class ExpenseData:
 
     @property
     def has_receipt(self) -> bool:
-        """Check if this expense has a receipt file."""
+        """Check if this expense has receipt file(s)."""
         import os
-        return bool(self.receipt_path and os.path.exists(self.receipt_path))
+        return bool(self.receipt_paths and any(os.path.exists(p) for p in self.receipt_paths))
 
 
 @dataclass
@@ -176,7 +176,7 @@ class RowAction:
     transaction: Dict[str, Any]  # CardTransaction as dict
 
     # ============ Match Results (from STAGE 2) ============
-    matched_receipt: Optional[Dict[str, Any]] = None  # MatchResult as dict
+    matched_receipts: List[Dict[str, Any]] = field(default_factory=list)  # MatchResult as dict
     matched_memo: Optional[Dict[str, Any]] = None  # MatchResult as dict
 
     # ============ Action Decision (from STAGE 3 user review) ============
@@ -199,7 +199,7 @@ class RowAction:
         return {
             "row_number": self.row_number,
             "transaction": self.transaction,
-            "matched_receipt": self.matched_receipt,
+            "matched_receipts": self.matched_receipts,
             "matched_memo": self.matched_memo,
             "action": self.action,
             "fill_data": self.fill_data,
@@ -216,7 +216,7 @@ class RowAction:
         return cls(
             row_number=data["row_number"],
             transaction=data["transaction"],
-            matched_receipt=data.get("matched_receipt"),
+            matched_receipts=data.get("matched_receipts") or ([data["matched_receipt"]] if data.get("matched_receipt") else []),
             matched_memo=data.get("matched_memo"),
             action=data.get("action", ActionType.SKIP.value),
             fill_data=data.get("fill_data"),

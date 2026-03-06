@@ -19,8 +19,11 @@ logger = logging.getLogger(__name__)
 
 # Fix hints shown when a check fails
 FIX_HINTS = {
-    "cdp": "Ensure Chrome is running with --remote-debugging-port=9444 (run /douzonebot:chrome)",
-    "claude_cli": "Run: claude /login (Claude Code CLI 인증 필요)",
+    "cdp": "Ensure Chrome is running with --remote-debugging-port=9222 and SSH tunnel is active",
+    "claude_cli": "Run: docker exec -it douzone-bot claude /login",
+    "gemini_cli": "Install Gemini CLI: npm install -g @anthropic-ai/gemini-cli (or check PATH)",
+    "openrouter": "Set openrouter.api_key in config.yaml or OPENROUTER_API_KEY env var",
+    "qwen25vl": "Check OCR API container on sapience-rtx-11: cd /nas2a/yeonghyeon/douzone-bot/ocr_api && docker compose up -d",
 }
 
 
@@ -62,21 +65,29 @@ def check_cdp(cdp_url: str, timeout: float = 3.0) -> Tuple[bool, str]:
         return False, f"Error: {e}"
 
 
+def check_qwen25vl(host: str = "200.168.0.41", port: int = 8810, timeout: float = 5.0) -> Tuple[bool, str]:
+    """Check Qwen2.5-VL OCR API is reachable."""
+    url = f"http://{host}:{port}/health"
+    try:
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode())
+            model = data.get("model", "unknown")
+            return True, f"OK (model: {model})"
+    except urllib.error.URLError as e:
+        reason = getattr(e, 'reason', str(e))
+        return False, f"Cannot connect to http://{host}:{port} ({reason})"
+    except Exception as e:
+        return False, f"Error: {e}"
+
+
 def check_claude_cli(timeout: float = 15.0) -> Tuple[bool, str]:
     """Check Claude Code CLI is available and authenticated."""
-    import os
-
     # Step 1: Binary exists?
     if not shutil.which("claude"):
         return False, "Binary not found in PATH"
 
-    # Step 2: Running inside Claude Code session?
-    # When invoked as a plugin skill, we're already inside Claude Code.
-    # Nested `claude -p` calls fail, but Claude Code is obviously available.
-    if os.environ.get("CLAUDECODE") or os.environ.get("CLAUDE_CODE_ENTRYPOINT"):
-        return True, "OK (running inside Claude Code session)"
-
-    # Step 3: Auth works? (minimal API round-trip)
+    # Step 2: Auth works? (minimal API round-trip)
     try:
         result = subprocess.run(
             ["claude", "-p", "Reply with exactly: ok",
@@ -91,9 +102,6 @@ def check_claude_cli(timeout: float = 15.0) -> Tuple[bool, str]:
             cli_output = json.loads(result.stdout)
             if cli_output.get("is_error"):
                 error_msg = cli_output.get("result", "unknown error")[:150]
-                # Check if error is about nested sessions
-                if "nested" in error_msg.lower() or "already running" in error_msg.lower():
-                    return True, "OK (running inside Claude Code session)"
                 return False, f"{error_msg}"
         except (json.JSONDecodeError, TypeError):
             pass
@@ -101,9 +109,6 @@ def check_claude_cli(timeout: float = 15.0) -> Tuple[bool, str]:
         # If JSON parsing failed or no is_error, check return code
         if result.returncode != 0:
             stderr_short = result.stderr.strip()[:200]
-            # Check stderr for nested session indicators
-            if "nested" in stderr_short.lower() or "already running" in stderr_short.lower():
-                return True, "OK (running inside Claude Code session)"
             return False, f"CLI error (exit {result.returncode}): {stderr_short}"
 
         return True, "OK (authenticated)"
@@ -114,10 +119,63 @@ def check_claude_cli(timeout: float = 15.0) -> Tuple[bool, str]:
         return False, f"Error: {e}"
 
 
+def check_gemini_cli(timeout: float = 10.0) -> Tuple[bool, str]:
+    """Check Gemini CLI is available."""
+    if not shutil.which("gemini"):
+        return False, "Binary not found in PATH"
+
+    try:
+        result = subprocess.run(
+            ["gemini", "--version"],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        if result.returncode != 0:
+            stderr_short = result.stderr.strip()[:200]
+            return False, f"CLI error (exit {result.returncode}): {stderr_short}"
+
+        version = result.stdout.strip()[:100]
+        return True, f"OK ({version})" if version else "OK"
+
+    except subprocess.TimeoutExpired:
+        return False, f"Timed out after {timeout}s"
+    except Exception as e:
+        return False, f"Error: {e}"
+
+
+def check_openrouter(config=None) -> Tuple[bool, str]:
+    """Check OpenRouter API key is configured."""
+    import os
+    api_key = ""
+    if config:
+        api_key = getattr(config, 'openrouter_api_key', '') or ''
+    if not api_key:
+        api_key = os.environ.get("OPENROUTER_API_KEY", "")
+
+    if not api_key:
+        return False, "No API key configured (set in config.yaml or OPENROUTER_API_KEY env var)"
+
+    # Mask the key for display
+    masked = api_key[:4] + "..." + api_key[-4:] if len(api_key) > 8 else "****"
+    return True, f"API key configured ({masked})"
+
+
 def _determine_requirements(args, config=None) -> dict:
-    """Determine which APIs are required based on mode, flags, and config."""
+    """Determine which APIs are required based on mode, flags, and config.
+
+    If config is provided, the LLM provider check is chosen based on
+    config.llm_provider instead of always checking Claude CLI.
+    """
     needs_cdp = False
-    needs_llm = False  # Claude Code CLI check
+    needs_llm = False  # Generic flag: "we need the configured LLM provider"
+    needs_qwen = False  # Always optional (warn only)
+
+    # Determine which LLM provider to check
+    llm_provider = "claude_code"  # default
+    if config and hasattr(config, 'llm_provider'):
+        llm_provider = config.llm_provider or "claude_code"
+
     if getattr(args, 'simple', False):
         # Simple mode: only CDP
         needs_cdp = True
@@ -137,9 +195,19 @@ def _determine_requirements(args, config=None) -> dict:
             needs_cdp = not test_mode
             needs_llm = True
 
+        # Qwen is checked but never required (warn only)
+        # In local mode, skip Qwen check entirely
+        is_local = config.is_local() if config else getattr(args, 'local', False)
+        if not is_local and not stage3_cache_in and not getattr(args, 'stage1_cache_in', None):
+            needs_qwen = True
+
+    # Map needs_llm to the specific provider check
     result = {
         "cdp": needs_cdp,
-        "claude_cli": needs_llm,
+        "claude_cli": needs_llm and llm_provider == "claude_code",
+        "gemini_cli": needs_llm and llm_provider == "gemini_cli",
+        "openrouter": needs_llm and llm_provider == "openrouter",
+        "qwen25vl": needs_qwen,
     }
 
     return result
@@ -152,7 +220,8 @@ def _print_report(report: PreflightReport, config=None) -> None:
     header_parts = ["Pre-flight API Check"]
     if config:
         mode = "local" if config.is_local() else "server"
-        header_parts.append(f"({mode} mode)")
+        provider = getattr(config, 'llm_provider', 'unknown')
+        header_parts.append(f"({mode} mode, provider: {provider})")
     print(" ".join(header_parts))
     print("=" * 60)
 
@@ -188,14 +257,25 @@ async def run_preflight(args, config=None) -> PreflightReport:
 
     # Build check tasks (run in parallel)
     check_defs = []
-    cdp_url = getattr(args, 'cdp_url', 'http://localhost:9444')
+    cdp_url = getattr(args, 'cdp_url', 'http://localhost:9222')
 
     if reqs["cdp"]:
-        check_defs.append(("cdp", "CDP connection", True,
-                           asyncio.to_thread(check_cdp, cdp_url)))
+        check_defs.append(("cdp", f"CDP connection ({cdp_url})", True,
+                           asyncio.to_thread(check_cdp, cdp_url, 8.0)))
     if reqs.get("claude_cli"):
         check_defs.append(("claude_cli", "Claude Code CLI", True,
                            asyncio.to_thread(check_claude_cli)))
+    if reqs.get("gemini_cli"):
+        check_defs.append(("gemini_cli", "Gemini CLI", True,
+                           asyncio.to_thread(check_gemini_cli)))
+    if reqs.get("openrouter"):
+        check_defs.append(("openrouter", "OpenRouter API", True,
+                           asyncio.to_thread(check_openrouter, config)))
+    if reqs.get("qwen25vl"):
+        # Qwen is never required - only warn
+        check_defs.append(("qwen25vl", "Qwen2.5-VL OCR API", False,
+                           asyncio.to_thread(check_qwen25vl)))
+
     # Execute all checks concurrently
     if check_defs:
         tasks = [cd[3] for cd in check_defs]
@@ -207,12 +287,44 @@ async def run_preflight(args, config=None) -> PreflightReport:
             else:
                 ok, msg = result
 
+            # Add context for Qwen warning
+            if key == "qwen25vl" and not ok:
+                llm_provider = config.llm_provider if config else "claude_code"
+                msg += f" (will use {llm_provider} for OCR)"
+
             report.checks.append(PreflightResult(
                 name=name,
                 required=required,
                 available=ok,
                 message=msg,
                 fix_hint=FIX_HINTS.get(key, "") if not ok else "",
+            ))
+
+    # Determine which provider checks exist
+    llm_provider = config.llm_provider if config else "claude_code"
+    # All possible provider-related keys and their display names
+    all_keys = {
+        "cdp": "CDP connection",
+        "claude_cli": "Claude Code CLI",
+        "gemini_cli": "Gemini CLI",
+        "openrouter": "OpenRouter API",
+        "qwen25vl": "Qwen2.5-VL OCR API",
+    }
+    checked_keys = {cd[0] for cd in check_defs}
+
+    # Add skipped checks for completeness
+    for key, name in all_keys.items():
+        if key not in checked_keys:
+            # Determine appropriate skip message
+            if key in ("claude_cli", "gemini_cli", "openrouter"):
+                msg = f"Not required (using {llm_provider})"
+            else:
+                msg = "Not required for this mode"
+            report.checks.append(PreflightResult(
+                name=name,
+                required=False,
+                available=True,
+                message=msg,
             ))
 
     _print_report(report, config=config)
