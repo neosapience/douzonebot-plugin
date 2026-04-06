@@ -10,16 +10,41 @@ allowed-tools: Bash, Read, Write, Edit, Glob, Grep, WebFetch, AskUserQuestion
 
 이 스킬은 환경 설정부터 실행까지 전 과정을 자동으로 처리합니다. 각 단계를 확인하고, 이미 완료된 단계는 건너뜁니다.
 
-진행 순서: **환경 확인 → Chrome → 사전 점검 → 실행**
+진행 순서: **안내 → 환경 확인 → Chrome → 사전 점검 → 실행**
+
+## Phase 0: 첫 사용자 안내
+
+처음 사용하는 사용자인지 판단합니다 (uv 미설치, 또는 사용자가 "처음", "어떻게" 등의 질문을 하는 경우).
+
+**처음 사용하는 사용자에게 안내할 내용:**
+
+> 이 플러그인은 더존 경비보고서 STEP 2 (지출정보등록)를 자동으로 채워줍니다.
+>
+> **준비할 것:**
+> 1. **메모 파일** (.txt) — 날짜별 참석자 정보. 예: `3/5 점심 홍길동 김철수 - 강남역 식당`
+> 2. **영수증 폴더** (선택) — JPG, PNG, HEIC, PDF 파일을 한 폴더에 모아주세요
+>
+> **알아두면 좋은 규정:**
+> - 배민/쿠팡이츠/카카오페이 등 PG 거래 → 영수증 첨부 필수 (실공급자 확인용)
+> - 코엑스/백화점 등 대형 쇼핑몰 → 영수증 첨부 권장
+> - 주차비 → 1건당 20만원 한도
+> - 결제+취소가 같이 있으면 → 둘 다 건너뛰거나 둘 다 제출 (취소분만 제출 금지)
+>
+> **영수증 팁:**
+> - 사진은 글씨가 잘 보이게 찍어주세요 (AI가 OCR로 읽습니다)
+> - 영수증 옆에 `.ocr.md` 파일을 두면 OCR을 건너뛰고 바로 사용합니다
+>   예: `receipt_0305.jpg` → `receipt_0305.ocr.md`
+
+재사용자 (uv 이미 설치됨, 별도 질문 없음) → 이 단계를 건너뛰고 Phase 1로 진행합니다.
+
+---
 
 ## 경로 규칙
 
 - **BOT_DIR**: 이 SKILL.md 파일의 grandparent 디렉토리 아래 `bot/` 폴더. 예: `plugin/skills/go/SKILL.md` → `plugin/skills/` → `plugin/` → `plugin/bot/`
-- **DATA_DIR**: `~/douzone-bot/` (사용자 설정 파일 — config.yaml만 저장)
 - **PLAN_FILE**: 실행 초반에 `mktemp`로 생성하는 임시 파일 (OS가 자동 정리)
 
 모든 `uv run` 명령은 BOT_DIR에서 실행합니다.
-config.yaml은 DATA_DIR에 있습니다.
 
 ## 중요: 실행 환경
 
@@ -33,7 +58,7 @@ Claude Code는 Windows에서도 bash (Git Bash/MSYS2) 쉘을 사용합니다.
 
 ## Phase 1: 환경 확인
 
-> **주의**: Phase 1의 각 단계를 **순서대로 하나씩** 실행하세요. 다른 파일 읽기(메모리 파일, config 등)를 Phase 1 명령과 병렬로 실행하면 sibling tool call 오류가 발생할 수 있습니다.
+> **주의**: Phase 1의 각 단계를 **순서대로 하나씩** 실행하세요.
 
 ### 1-1. OS 감지
 
@@ -53,7 +78,7 @@ uv --version 2>/dev/null || echo "UV_NOT_FOUND"
 ```
 
 - 설치되어 있으면 → 건너뛰기
-- 없으면 OS별 설치:
+- 없으면 (처음 사용하는 사용자) OS별 설치:
   - **macOS / Linux:**
     ```bash
     curl -LsSf https://astral.sh/uv/install.sh | sh
@@ -67,6 +92,8 @@ uv --version 2>/dev/null || echo "UV_NOT_FOUND"
     export PATH="$HOME/.local/bin:$USERPROFILE/.local/bin:$PATH"
     uv --version
     ```
+  - uv를 **새로 설치한 경우**, 플러그인 자동 업데이트를 안내합니다:
+    > "플러그인 자동 업데이트를 켜면 새 버전이 나올 때 자동으로 반영됩니다. `/plugin` 입력 → Marketplaces 탭 → neosapience-douzone-bot → Enable auto-update를 클릭해주세요. 한 번만 설정하면 됩니다."
 
 **중요**: 이후 모든 `uv` 명령 앞에 PATH + 인코딩 설정을 포함합니다:
 ```bash
@@ -74,29 +101,6 @@ export PATH="$HOME/.local/bin:$USERPROFILE/.local/bin:$PATH" PYTHONIOENCODING=ut
 ```
 
 > **참고**: 처음 실행 시 `uv`가 필요한 패키지를 자동 다운로드합니다 (약 20개, 1~2분 소요). 이후 실행에서는 캐시를 사용하므로 빠르게 시작됩니다.
-
-### 1-3. config.yaml 확인
-
-```bash
-test -f "$HOME/douzone-bot/config.yaml" && cat "$HOME/douzone-bot/config.yaml" || echo "NO_CONFIG"
-```
-
-- 이미 있으면 내용 표시 후 건너뛰기
-- 없으면:
-  1. 데이터 디렉토리 생성: `mkdir -p "$HOME/douzone-bot"`
-  2. Write 도구로 `~/douzone-bot/config.yaml` 생성:
-     ```yaml
-     mode: local
-     ```
-  - `user_name`은 여기서 물어보지 않습니다 — 실행 시 웹 대시보드나 CLI에서 입력합니다.
-
-### 1-4. 자동 업데이트 안내 (처음 설치 시)
-
-config.yaml을 **새로 생성한 경우** (처음 사용하는 사용자), 플러그인 자동 업데이트를 안내합니다:
-
-> "플러그인 자동 업데이트를 켜면 새 버전이 나올 때 자동으로 반영됩니다. `/plugin` 입력 → Marketplaces 탭 → neosapience-douzone-bot → Enable auto-update를 클릭해주세요. 한 번만 설정하면 됩니다."
-
-config.yaml이 이미 있었으면 (재실행) 이 단계를 건너뜁니다.
 
 **Phase 1 완료**: "✓ 환경 준비 완료"
 
@@ -108,22 +112,22 @@ config.yaml이 이미 있었으면 (재실행) 이 단계를 건너뜁니다.
 
 launcher.py가 자동으로 처리합니다:
 - Chrome 경로 탐색 (OS별 자동 감지)
-- 포트 충돌 감지 및 자동 해결 (빈 포트 탐색 + config.yaml 업데이트)
+- 포트 충돌 감지 및 자동 해결 (빈 포트 탐색)
 - CDP 연결 확인 (이미 실행 중이면 재사용)
 
 ```bash
 export PATH="$HOME/.local/bin:$USERPROFILE/.local/bin:$PATH" PYTHONIOENCODING=utf-8 NODE_NO_WARNINGS=1 && cd "<BOT_DIR>" && uv run --with-requirements requirements-local.txt python ui/launcher.py --chrome
 ```
 
-출력에서 `CHROME_OK=true`이면 성공. 포트 충돌 시 자동으로 다음 포트를 찾고 config.yaml을 업데이트합니다.
+출력에서 `CHROME_OK=true`와 `CHROME_PORT=<포트>`를 파싱합니다. **이 포트 값을 이후 모든 단계에서 `CDP_PORT`로 사용합니다.**
 
 > ⚠️ **중요**: 자동화 Chrome 창을 **전체 화면(최대화)** 상태로 유지하세요. 창이 작으면 더존 UI 요소가 보이지 않아 자동화가 실패할 수 있습니다. 사용자에게 반드시 안내하세요.
 
 ### 2-2. CDP 연결 확인
 
+Phase 2-1에서 파싱한 포트를 사용합니다:
+
 ```bash
-CDP_PORT=$(grep chrome_debug_port "$HOME/douzone-bot/config.yaml" 2>/dev/null | awk '{print $2}')
-CDP_PORT=${CDP_PORT:-9444}
 curl -s --connect-timeout 3 http://localhost:$CDP_PORT/json/version && echo "CDP_OK"
 ```
 
@@ -148,8 +152,10 @@ Chrome 실행 확인 후 사용자에게 안내:
 
 ### 3-1. Preflight 실행
 
+Phase 2에서 파싱한 `CDP_PORT`를 사용합니다:
+
 ```bash
-export PATH="$HOME/.local/bin:$USERPROFILE/.local/bin:$PATH" PYTHONIOENCODING=utf-8 NODE_NO_WARNINGS=1 && cd "<BOT_DIR>" && uv run --with-requirements requirements-local.txt python main.py --local --preflight-only --user dummy
+export PATH="$HOME/.local/bin:$USERPROFILE/.local/bin:$PATH" PYTHONIOENCODING=utf-8 NODE_NO_WARNINGS=1 && cd "<BOT_DIR>" && uv run --with-requirements requirements-local.txt python main.py --local --preflight-only --user dummy --cdp-url http://localhost:$CDP_PORT
 ```
 
 ### 3-2. 결과 파싱
@@ -159,7 +165,7 @@ export PATH="$HOME/.local/bin:$USERPROFILE/.local/bin:$PATH" PYTHONIOENCODING=ut
 - **모두 PASS** → "✓ 모든 점검 통과" 표시 후 Phase 4로
 - **FAIL 있음** → 각 실패에 대해 원인과 해결 방법 설명:
   - **CDP 연결 실패**: "Chrome 자동화 창이 연결되지 않습니다. Chrome이 열려있는지 확인하세요."
-    - CDP 실패 시 `curl -s http://localhost:<포트>/json/version`으로 수동 확인. 응답이 오면 preflight 내부 문제이므로 `--skip-preflight`로 우회 가능
+    - CDP 실패 시 `curl -s http://localhost:$CDP_PORT/json/version`으로 수동 확인. 응답이 오면 preflight 내부 문제이므로 `--skip-preflight`로 우회 가능
   - **Claude Code CLI 실패**: "Claude CLI 인증이 필요합니다. `claude /login`으로 로그인하세요."
   - 문제 해결 후 "다시 점검해 볼까요?" → 재실행
   - curl로 CDP가 확인되면 `--skip-preflight` 플래그를 추가하여 Phase 4로 진행 가능
@@ -181,13 +187,15 @@ AskUserQuestion으로 질문:
 
 CLI 모드(전체 또는 간단) 선택 시, 아래 정보를 수집합니다:
 
-1. **사용자 이름**: config.yaml의 `user_name` 확인 → 없으면 사용자에게 직접 질문 (자유 텍스트 — AskUserQuestion 사용 금지)
+1. **사용자 이름**: 사용자에게 직접 질문 (자유 텍스트 — AskUserQuestion 사용 금지)
 2. **메모 파일** (전체 모드만): 메모 텍스트 파일 경로 → 파일 존재 확인 후 내용 미리보기
 3. **영수증 폴더** (전체 모드만): 영수증 폴더 경로 → 파일 개수 확인 (이미지 + PDF)
    - **PDF 영수증 지원**: 이미지(JPG, PNG, HEIC)뿐만 아니라 PDF 파일도 영수증으로 처리됩니다.
    - **사전 OCR 지원**: 영수증 파일 옆에 `.ocr.md` (또는 `.ocr.txt`, `.ocr.json`) 파일이 있으면 Vision AI를 건너뛰고 해당 텍스트를 직접 사용합니다. OCR이 미리 준비된 영수증 폴더도 그대로 사용 가능합니다.
 
 메모/영수증이 없으면 해당 `--memo`/`--receipts` 플래그를 생략합니다 (기본 참석자만 입력됨).
+
+**중요**: 모든 `python main.py` 명령에 `--cdp-url http://localhost:$CDP_PORT`를 포함합니다 (Phase 2에서 파싱한 포트).
 
 ### 4-2. 대시보드 입력 모드
 
@@ -200,10 +208,10 @@ export PATH="$HOME/.local/bin:$USERPROFILE/.local/bin:$PATH" PYTHONIOENCODING=ut
 출력에서 `DASHBOARD_OK=true`와 `DASHBOARD_PORT=<포트>` 값을 확인합니다. 실패 시(`DASHBOARD_OK=false`) 에러 메시지를 사용자에게 안내합니다.
 
 2. **브라우저 열기** (출력에서 확인한 포트로):
-- macOS: `open http://localhost:$PORT`
-- Windows: `powershell -Command "Start-Process 'http://localhost:$PORT'"`
-- Linux: `xdg-open http://localhost:$PORT`
-- 포트가 5000이 아니면 사용자에게 안내: "포트 5000이 사용 중이어서 $PORT로 대시보드를 열었습니다."
+- macOS: `open http://localhost:$DASHBOARD_PORT`
+- Windows: `powershell -Command "Start-Process 'http://localhost:$DASHBOARD_PORT'"`
+- Linux: `xdg-open http://localhost:$DASHBOARD_PORT`
+- 포트가 5000이 아니면 사용자에게 안내: "포트 5000이 사용 중이어서 $DASHBOARD_PORT로 대시보드를 열었습니다."
 
 3. 사용자에게 안내:
    - "대시보드에서 메모와 영수증을 입력한 후 '저장' 버튼을 눌러주세요."
@@ -211,7 +219,7 @@ export PATH="$HOME/.local/bin:$USERPROFILE/.local/bin:$PATH" PYTHONIOENCODING=ut
 
 4. 사용자가 저장 완료를 알리면, 저장된 데이터를 읽어서 변수에 저장:
 ```bash
-curl -s http://localhost:$PORT/data
+curl -s http://localhost:$DASHBOARD_PORT/data
 ```
 → 응답에서 `memo_path`, `receipts_path`, `user_name` 값을 추출
 
@@ -219,9 +227,8 @@ curl -s http://localhost:$PORT/data
 
 ### 4-3. CLI 간단 모드
 
-config.yaml에서 `user_name` 가져오기:
 ```bash
-export PATH="$HOME/.local/bin:$USERPROFILE/.local/bin:$PATH" PYTHONIOENCODING=utf-8 NODE_NO_WARNINGS=1 && cd "<BOT_DIR>" && uv run --with-requirements requirements-local.txt python main.py --local -q --user "<이름>" --simple
+export PATH="$HOME/.local/bin:$USERPROFILE/.local/bin:$PATH" PYTHONIOENCODING=utf-8 NODE_NO_WARNINGS=1 && cd "<BOT_DIR>" && uv run --with-requirements requirements-local.txt python main.py --local -q --user "<이름>" --simple --cdp-url http://localhost:$CDP_PORT
 ```
 
 > 실행 후 더존 화면에서 변화가 나타나기까지 수 초 걸릴 수 있습니다. 사용자에게 "더존 화면에서 자동 입력이 시작됩니다. 잠시 기다려 주세요."라고 안내하세요.
@@ -242,7 +249,7 @@ echo "PLAN_FILE=$PLAN_FILE"
 더존 그리드 읽기, 메모 파싱, 영수증 OCR, 거래 매칭을 한 번에 실행하고 결과를 JSON으로 저장합니다:
 
 ```bash
-export PATH="$HOME/.local/bin:$USERPROFILE/.local/bin:$PATH" PYTHONIOENCODING=utf-8 NODE_NO_WARNINGS=1 && cd "<BOT_DIR>" && uv run --with-requirements requirements-local.txt python main.py --local -q --user "<이름>" --memo <메모경로> --receipts <영수증경로> --stage2-cache-out "$PLAN_FILE" --stage2-only
+export PATH="$HOME/.local/bin:$USERPROFILE/.local/bin:$PATH" PYTHONIOENCODING=utf-8 NODE_NO_WARNINGS=1 && cd "<BOT_DIR>" && uv run --with-requirements requirements-local.txt python main.py --local -q --user "<이름>" --memo <메모경로> --receipts <영수증경로> --stage2-cache-out "$PLAN_FILE" --stage2-only --cdp-url http://localhost:$CDP_PORT
 ```
 
 - `--stage2-cache-out`: 매칭 결과를 JSON으로 저장
@@ -254,7 +261,7 @@ export PATH="$HOME/.local/bin:$USERPROFILE/.local/bin:$PATH" PYTHONIOENCODING=ut
 매칭 결과를 로드하여 정리된 요약을 출력합니다:
 
 ```bash
-export PATH="$HOME/.local/bin:$USERPROFILE/.local/bin:$PATH" PYTHONIOENCODING=utf-8 NODE_NO_WARNINGS=1 && cd "<BOT_DIR>" && uv run --with-requirements requirements-local.txt python main.py --local -q --user "<이름>" --stage2-cache-in "$PLAN_FILE" --review-only
+export PATH="$HOME/.local/bin:$USERPROFILE/.local/bin:$PATH" PYTHONIOENCODING=utf-8 NODE_NO_WARNINGS=1 && cd "<BOT_DIR>" && uv run --with-requirements requirements-local.txt python main.py --local -q --user "<이름>" --stage2-cache-in "$PLAN_FILE" --review-only --cdp-url http://localhost:$CDP_PORT
 ```
 
 - `--review-only`: 매칭 결과를 날짜별로 그룹화하여 보여주고, 확인이 필요한 항목을 ⚠️ 로 표시. 실행은 하지 않음.
@@ -275,7 +282,7 @@ export PATH="$HOME/.local/bin:$USERPROFILE/.local/bin:$PATH" PYTHONIOENCODING=ut
 매칭 결과를 로드하여 더존에 자동 입력합니다:
 
 ```bash
-export PATH="$HOME/.local/bin:$USERPROFILE/.local/bin:$PATH" PYTHONIOENCODING=utf-8 NODE_NO_WARNINGS=1 && cd "<BOT_DIR>" && uv run --with-requirements requirements-local.txt python main.py --local -q --user "<이름>" --stage2-cache-in "$PLAN_FILE" --auto-approve
+export PATH="$HOME/.local/bin:$USERPROFILE/.local/bin:$PATH" PYTHONIOENCODING=utf-8 NODE_NO_WARNINGS=1 && cd "<BOT_DIR>" && uv run --with-requirements requirements-local.txt python main.py --local -q --user "<이름>" --stage2-cache-in "$PLAN_FILE" --auto-approve --cdp-url http://localhost:$CDP_PORT
 ```
 
 - `--stage2-cache-in`: 4-4a에서 저장한 매칭 결과를 로드 (데이터 재수집 건너뜀)
@@ -305,7 +312,7 @@ export PATH="$HOME/.local/bin:$USERPROFILE/.local/bin:$PATH" PYTHONIOENCODING=ut
 대시보드 모드를 사용했으면 서버를 종료합니다:
 
 ```bash
-curl -s -X POST http://localhost:$PORT/shutdown 2>/dev/null || true
+curl -s -X POST http://localhost:$DASHBOARD_PORT/shutdown 2>/dev/null || true
 ```
 
 대시보드를 사용하지 않은 경우 이 단계를 건너뜁니다.

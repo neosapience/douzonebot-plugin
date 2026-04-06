@@ -33,11 +33,7 @@ The agent handles everything: environment setup, Chrome launch, pre-flight check
 ## Skills
 
 ```
-/douzonebot:go            End-to-end automation (recommended)
-/douzonebot:setup         First-time setup wizard
-/douzonebot:chrome        Launch automation Chrome
-/douzonebot:preflight     Pre-flight health checks
-/douzonebot:run           Run automation (standalone)
+/douzonebot:go            End-to-end automation (setup + Chrome + preflight + run)
 /douzonebot:troubleshoot  Diagnose errors
 /douzonebot:uninstall     Clean removal
 ```

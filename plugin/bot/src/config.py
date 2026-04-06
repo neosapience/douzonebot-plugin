@@ -31,7 +31,7 @@ class AppConfig:
 
     # Provider selection
     llm_provider: str = "claude_code"  # claude_code | gemini_cli | openrouter
-    receipt_provider: str = "auto"  # claude_code | gemini_cli | openrouter | auto
+    receipt_provider: str = "auto"  # claude_code | gemini_cli | openrouter | qwen25vl | auto
 
     # Chrome debug port (for CDP connection)
     chrome_debug_port: int = 9444

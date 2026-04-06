@@ -17,7 +17,7 @@ allowed-tools: Bash, Read, AskUserQuestion
 먼저 각 항목의 존재 여부를 **순서대로 하나씩** 확인합니다:
 
 ```bash
-# 1. 사용자 데이터 (config.yaml, 세션 데이터)
+# 1. 사용자 데이터
 test -d "$HOME/douzone-bot" && echo "FOUND: ~/douzone-bot" || echo "NOT_FOUND: ~/douzone-bot"
 ```
 
@@ -66,10 +66,10 @@ done
 ```
 
 ```bash
-# 6. 자동화 Chrome 프로세스 (config.yaml에서 포트 확인)
-CDP_PORT=$(grep chrome_debug_port "$HOME/douzone-bot/config.yaml" 2>/dev/null | awk '{print $2}')
-CDP_PORT=${CDP_PORT:-9444}
-curl -s --connect-timeout 2 http://localhost:$CDP_PORT/json/version 2>/dev/null && echo "RUNNING: Chrome :$CDP_PORT" || echo "NOT_RUNNING"
+# 6. 자동화 Chrome 프로세스 (기본 포트 9444 확인)
+for CDP_PORT in 9444 9445 9446 9222; do
+    curl -s --connect-timeout 2 http://localhost:$CDP_PORT/json/version 2>/dev/null && echo "RUNNING: Chrome :$CDP_PORT" && break
+done || echo "NOT_RUNNING"
 ```
 
 ## 사용자 확인
@@ -79,7 +79,7 @@ curl -s --connect-timeout 2 http://localhost:$CDP_PORT/json/version 2>/dev/null 
 > "다음 항목을 제거합니다:"
 > - 실행 중인 봇 프로세스 종료 (웹 대시보드, 파이프라인, 런처)
 > - 자동화 Chrome 프로세스 종료
-> - ~/douzone-bot (config.yaml + 세션 데이터)
+> - ~/douzone-bot (세션 데이터)
 > - ~/.douzone-chrome (자동화 Chrome 프로필 — 더존 로그인 정보 포함)
 > - uv (Python 패키지 매니저)
 > - uv 캐시
@@ -148,31 +148,32 @@ echo "✓ 포트 정리 완료"
 
 ### 2. 자동화 Chrome 종료
 
-config.yaml에서 포트를 읽고, 해당 포트에서 실행 중인 Chrome이 있으면 종료합니다:
-
-```bash
-CDP_PORT=$(grep chrome_debug_port "$HOME/douzone-bot/config.yaml" 2>/dev/null | awk '{print $2}')
-CDP_PORT=${CDP_PORT:-9444}
-```
+자동화 Chrome이 사용할 수 있는 포트들을 확인하고 종료합니다:
 
 **macOS / Linux:**
 ```bash
-CHROME_PID=$(lsof -ti :$CDP_PORT 2>/dev/null)
-if [ -n "$CHROME_PID" ]; then
-    kill $CHROME_PID && echo "Chrome 프로세스 종료됨 (PID: $CHROME_PID)"
-else
-    echo "실행 중인 자동화 Chrome 없음"
-fi
+KILLED=false
+for CDP_PORT in 9444 9445 9446 9222; do
+    CHROME_PID=$(lsof -ti :$CDP_PORT 2>/dev/null)
+    if [ -n "$CHROME_PID" ]; then
+        kill $CHROME_PID && echo "Chrome 프로세스 종료됨 (포트: $CDP_PORT, PID: $CHROME_PID)"
+        KILLED=true
+    fi
+done
+$KILLED || echo "실행 중인 자동화 Chrome 없음"
 ```
 
 **Windows (bash에서):**
 ```bash
-CHROME_PID=$(netstat -ano 2>/dev/null | grep ":$CDP_PORT" | grep "LISTENING" | awk '{print $5}' | head -1)
-if [ -n "$CHROME_PID" ]; then
-    taskkill //PID $CHROME_PID //F 2>/dev/null && echo "Chrome 프로세스 종료됨 (PID: $CHROME_PID)"
-else
-    echo "실행 중인 자동화 Chrome 없음"
-fi
+KILLED=false
+for CDP_PORT in 9444 9445 9446 9222; do
+    CHROME_PID=$(netstat -ano 2>/dev/null | grep ":$CDP_PORT" | grep "LISTENING" | awk '{print $5}' | head -1)
+    if [ -n "$CHROME_PID" ]; then
+        taskkill //PID $CHROME_PID //F 2>/dev/null && echo "Chrome 프로세스 종료됨 (포트: $CDP_PORT, PID: $CHROME_PID)"
+        KILLED=true
+    fi
+done
+$KILLED || echo "실행 중인 자동화 Chrome 없음"
 ```
 
 ### 3. 사용자 데이터 제거
@@ -227,7 +228,7 @@ echo "✓ uv 제거됨"
 > "제거된 항목:"
 > - 봇 프로세스 종료 (웹 대시보드, 파이프라인, 런처)
 > - 자동화 Chrome 프로세스 종료
-> - ~/douzone-bot (config.yaml, 세션 데이터)
+> - ~/douzone-bot (세션 데이터)
 > - ~/.douzone-chrome (자동화 Chrome 프로필)
 > - uv 캐시
 > - [uv (선택한 경우)]

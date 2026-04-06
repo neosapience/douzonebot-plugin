@@ -88,6 +88,9 @@ class ExpenseData:
     # Optional: for pending receipts (when receipt is missing)
     pending_reason: Optional[str] = None  # Reason for missing receipt (e.g., "영수증 분실")
 
+    # Optional: 비고 notes to fill (from Stage 2 matching)
+    bigo_notes: List[str] = field(default_factory=list)
+
     # Flags for automation - whether to fill 용도/내용 in grid (before popup)
     needs_yongdo: bool = False  # True if 용도 column needs to be filled
     needs_content: bool = False  # True if 내용 column needs to be filled
@@ -147,6 +150,84 @@ def get_column_index(column_name: str) -> int:
 # ============================================================================
 # STAGE 3 Output Models (Execution Plan)
 # ============================================================================
+
+class VerificationIssueType(Enum):
+    """Type of issue detected during post-verification."""
+    PG_MISSING_RECEIPT = "pg_missing_receipt"
+    PG_MISSING_SUPPLIER = "pg_missing_supplier"
+    CHARGE_CANCEL_PAIR = "charge_cancel_pair"
+    PARKING_OVER_CAP = "parking_over_cap"
+
+
+@dataclass
+class VerificationIssue:
+    """A single issue detected during post-verification."""
+    issue_type: str              # VerificationIssueType value
+    row_numbers: List[int]       # Affected row(s) (1-based)
+    merchant: str
+    amount: int                  # Transaction amount (won)
+    description: str             # Human-readable description
+    resolved: bool = False
+    resolution: Optional[str] = None  # What user chose (e.g., "skipped", "fixed", "acknowledged")
+    paired_row_number: Optional[int] = None  # For charge+cancel pairs
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "issue_type": self.issue_type,
+            "row_numbers": self.row_numbers,
+            "merchant": self.merchant,
+            "amount": self.amount,
+            "description": self.description,
+            "resolved": self.resolved,
+            "resolution": self.resolution,
+            "paired_row_number": self.paired_row_number,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'VerificationIssue':
+        return cls(
+            issue_type=data["issue_type"],
+            row_numbers=data["row_numbers"],
+            merchant=data["merchant"],
+            amount=data.get("amount", 0),
+            description=data["description"],
+            resolved=data.get("resolved", False),
+            resolution=data.get("resolution"),
+            paired_row_number=data.get("paired_row_number"),
+        )
+
+
+@dataclass
+class PostVerificationResult:
+    """Result of the post-verification scan."""
+    started_at: str
+    completed_at: Optional[str] = None
+    total_issues: int = 0
+    resolved_issues: int = 0
+    issues: List[VerificationIssue] = field(default_factory=list)
+    passed: bool = True  # True if no issues found
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "started_at": self.started_at,
+            "completed_at": self.completed_at,
+            "total_issues": self.total_issues,
+            "resolved_issues": self.resolved_issues,
+            "issues": [i.to_dict() for i in self.issues],
+            "passed": self.passed,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> 'PostVerificationResult':
+        return cls(
+            started_at=data["started_at"],
+            completed_at=data.get("completed_at"),
+            total_issues=data.get("total_issues", 0),
+            resolved_issues=data.get("resolved_issues", 0),
+            issues=[VerificationIssue.from_dict(i) for i in data.get("issues", [])],
+            passed=data.get("passed", True),
+        )
+
 
 class ActionType(Enum):
     """Type of action to take for a row in STAGE 4."""
@@ -253,6 +334,9 @@ class ExecutionPlan:
     stage4_failed_count: int = 0
     stage4_skipped_count: int = 0
 
+    # ============ Post-Verification (Stage 5) ============
+    post_verification: Optional[Dict[str, Any]] = None
+
     @property
     def is_complete(self) -> bool:
         """Check if all processable rows have been executed."""
@@ -296,6 +380,7 @@ class ExecutionPlan:
             "stage4_success_count": self.stage4_success_count,
             "stage4_failed_count": self.stage4_failed_count,
             "stage4_skipped_count": self.stage4_skipped_count,
+            "post_verification": self.post_verification,
         }
 
     @classmethod
@@ -315,4 +400,5 @@ class ExecutionPlan:
             stage4_success_count=data.get("stage4_success_count", 0),
             stage4_failed_count=data.get("stage4_failed_count", 0),
             stage4_skipped_count=data.get("stage4_skipped_count", 0),
+            post_verification=data.get("post_verification"),
         )

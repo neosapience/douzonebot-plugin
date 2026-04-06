@@ -3092,6 +3092,7 @@ class DouzoneAutomation:
                             logger.info(f"Filled 사업자번호: {data.supplier_biz_no}")
 
                 # Attach receipt file(s)
+                attached_receipts = []
                 for receipt_path in valid_receipts:
                     debug.state(f"Attaching receipt: {receipt_path}")
                     attached = await self.attach_file(receipt_path)
@@ -3099,7 +3100,10 @@ class DouzoneAutomation:
                         debug.error(f"Failed to attach receipt")
                         logger.warning(f"Failed to attach receipt: {receipt_path}")
                     else:
+                        attached_receipts.append(receipt_path)
                         debug.success(f"Receipt attached: {os.path.basename(receipt_path)}")
+                # Store which receipts actually attached for post-verification
+                data._attached_receipts = attached_receipts
 
             elif data.needs_supplier_info:
                 # Missing receipt for a transaction that needs supplier info
@@ -3112,6 +3116,29 @@ class DouzoneAutomation:
                 await self.fill_bigo_field(note)
                 debug.fill("비고", note)
                 logger.info(f"Added pending receipt note to 비고: {note}")
+
+            # Fill bigo_notes (from Stage 2 matching — e.g., pending receipt reasons)
+            # fill_bigo_field appends to existing content, so this is safe to call
+            # even if the needs_supplier_info path already wrote something.
+            # But skip if the content would duplicate (same [영수증 대기] message).
+            bigo_notes = getattr(data, 'bigo_notes', None) or []
+            if bigo_notes:
+                # Check if bigo was already filled with the same content by the supplier path
+                bigo_input = self.page.locator('input[placeholder*="비고"]').first
+                current_bigo = ""
+                try:
+                    if await bigo_input.is_visible():
+                        current_bigo = await bigo_input.input_value() or ""
+                except Exception:
+                    pass
+                # Only add notes that aren't already present
+                new_notes = [n for n in bigo_notes if n not in current_bigo]
+                if new_notes:
+                    combined = " / ".join(new_notes)
+                    debug.state(f"Adding bigo notes: {combined}")
+                    await self.fill_bigo_field(combined)
+                    debug.fill("비고", combined)
+                    logger.info(f"Filled 비고 from bigo_notes: {combined}")
 
             # Take screenshot after filling
             if debug.enabled:
@@ -3476,6 +3503,171 @@ class DouzoneAutomation:
     # Row Processing
     # =========================================================================
 
+    async def _open_popup_for_row(self, row_index: int, popup_timeout: float = 5.0) -> bool:
+        """
+        Open the expense popup for a specific grid row.
+
+        Shared helper used by both process_row (Stage 4) and post-verification
+        fix flows (Stage 5). Handles the full state-setup sequence:
+        1. ensure_popup_closed() pre-flight cleanup
+        2. _activate_grid()
+        3. _update_canvas_position()
+        4. get_grid_row_count() internally for total_rows
+        5. get_visible_row_count() for navigation
+        6. navigate_to_row() with view-index calculation
+        7. Click row select + click_plus_button_verified (or API fallback)
+        8. wait_for_popup_or_warning() with timeout
+        9. Wrong-row detection and retry
+
+        Does NOT fill any fields or close/save the popup. Caller handles that.
+
+        Args:
+            row_index: Row number (0-indexed)
+            popup_timeout: Timeout for waiting for popup (seconds)
+
+        Returns:
+            True if popup is open on the correct row, False on failure.
+        """
+        try:
+            # Pre-flight: ensure clean state
+            if not await self.ensure_popup_closed():
+                debug.error("Could not clean up popup state!")
+                return False
+
+            # Refresh canvas position
+            await self._update_canvas_position()
+
+            # Get grid dimensions
+            total_rows = await self.get_grid_row_count() or (row_index + 1)
+            visible_rows = await self.get_visible_row_count()
+            if not visible_rows or visible_rows <= 0:
+                visible_rows = 10
+
+            # Activate grid
+            await self._activate_grid()
+
+            # Navigate to row
+            actual_view_index = None
+            if total_rows > 0:
+                actual_view_index = await self.navigate_to_row(
+                    row_index, total_rows, visible_rows
+                )
+
+            if actual_view_index is None:
+                top_item = await self.get_grid_top_item()
+                if top_item is not None:
+                    offset = 1 if top_item > 0 else 0
+                    actual_view_index = row_index - top_item + offset
+
+                    if actual_view_index < 0 or actual_view_index > 6:
+                        target_top = max(0, row_index - 5)
+                        logger.info(
+                            f"Row {row_index + 1}: Scrolling to position "
+                            f"(topItem={top_item} -> {target_top})"
+                        )
+                        await self.set_grid_top_item(target_top)
+                        await asyncio.sleep(0.6)
+
+                        top_item = await self.get_grid_top_item() or target_top
+                        offset = 1 if top_item > 0 else 0
+                        actual_view_index = row_index - top_item + offset
+
+                    if actual_view_index < 0 or actual_view_index > 12:
+                        logger.warning(
+                            f"Row {row_index + 1}: Invalid view_index {actual_view_index}, using fallback"
+                        )
+                        actual_view_index = 5
+                else:
+                    actual_view_index = 5
+
+            if visible_rows and actual_view_index is not None:
+                if actual_view_index >= max(0, visible_rows - 1):
+                    target_top = max(0, row_index - max(1, visible_rows - 2))
+                    logger.info(
+                        f"Row {row_index + 1}: Adjusting topItem to avoid bottom edge "
+                        f"(view={actual_view_index} -> target_top={target_top})"
+                    )
+                    await self.set_grid_top_item(target_top)
+                    await asyncio.sleep(0.4)
+                    top_item = await self.get_grid_top_item()
+                    if top_item is not None:
+                        actual_view_index = row_index - top_item
+
+            # Click row and open popup
+            if actual_view_index is not None:
+                grid = self.get_canvas_grid()
+                rel_y = await self._find_rel_y_for_row(row_index, actual_view_index)
+                x = grid.x + 120
+                y = grid.y + rel_y
+                debug.click(
+                    x, y, f"row select (view {actual_view_index}, verified)"
+                )
+                logger.info(
+                    f"Clicking row select (view {actual_view_index}, verified) at ({x:.0f}, {y:.0f})"
+                )
+                await self.click_position(x, y)
+                await asyncio.sleep(0.1)
+                await self.click_plus_button_verified(
+                    row_index, view_index=actual_view_index
+                )
+            else:
+                await self.click_plus_button_api(row_index)
+
+            # Wait for popup
+            outcome = await self.wait_for_popup_or_warning(timeout=popup_timeout)
+            if outcome == "warning":
+                debug.error("Missing required fields warning detected")
+                return False
+            if outcome != "popup":
+                debug.error("Popup did not open!")
+                return False
+
+            # Verify popup corresponds to target row (avoid wrong-row fill)
+            current_row = await self.get_grid_current_row()
+            if current_row is not None and current_row != row_index:
+                logger.warning(
+                    f"Row {row_index + 1}: Popup opened on different row "
+                    f"(current={current_row + 1}). Retrying row focus."
+                )
+                await self.close_popup()
+                await asyncio.sleep(0.2)
+
+                retry_view_index = None
+                if total_rows > 0:
+                    retry_view_index = await self.navigate_to_row(
+                        row_index, total_rows, visible_rows
+                    )
+                if retry_view_index is None:
+                    retry_view_index = actual_view_index
+                if retry_view_index is not None:
+                    await self.click_row_by_view(retry_view_index)
+                    await asyncio.sleep(0.1)
+                    await self.click_plus_button_verified(
+                        row_index, view_index=retry_view_index
+                    )
+                else:
+                    await self.click_plus_button_api(row_index)
+
+                outcome = await self.wait_for_popup_or_warning(timeout=3.0)
+                if outcome == "warning":
+                    return False
+                if outcome != "popup":
+                    return False
+
+                current_row = await self.get_grid_current_row()
+                if current_row is not None and current_row != row_index:
+                    logger.warning(
+                        f"Row {row_index + 1}: Popup opened on wrong row after retry "
+                        f"(current={current_row + 1})"
+                    )
+                    return False
+
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to open popup for row {row_index + 1}: {e}")
+            return False
+
     async def process_row(
         self,
         row_index: int,
@@ -3631,127 +3823,12 @@ class DouzoneAutomation:
                 if slow_mode:
                     await asyncio.sleep(0.4)
 
-                # Step 2: Navigate to row and click '+' (verified)
-                debug.action("STEP2", "navigating to row and clicking +")
-                await self._activate_grid()
-
-                visible_rows = await self.get_visible_row_count()
-                if not visible_rows or visible_rows <= 0:
-                    visible_rows = 10
-
-                actual_view_index = None
-                if total_rows > 0:
-                    actual_view_index = await self.navigate_to_row(
-                        row_index, total_rows, visible_rows
-                    )
-
-                if actual_view_index is None:
-                    top_item = await self.get_grid_top_item()
-                    if top_item is not None:
-                        offset = 1 if top_item > 0 else 0
-                        actual_view_index = row_index - top_item + offset
-
-                        if actual_view_index < 0 or actual_view_index > 6:
-                            target_top = max(0, row_index - 5)
-                            logger.info(
-                                f"Row {row_index + 1}: Scrolling to position "
-                                f"(topItem={top_item} -> {target_top})"
-                            )
-                            await self.set_grid_top_item(target_top)
-                            await asyncio.sleep(0.6)
-
-                            top_item = await self.get_grid_top_item() or target_top
-                            offset = 1 if top_item > 0 else 0
-                            actual_view_index = row_index - top_item + offset
-
-                        if actual_view_index < 0 or actual_view_index > 12:
-                            logger.warning(
-                                f"Row {row_index + 1}: Invalid view_index {actual_view_index}, using fallback"
-                            )
-                            actual_view_index = 5
-                    else:
-                        actual_view_index = 5
-
-                if visible_rows and actual_view_index is not None:
-                    if actual_view_index >= max(0, visible_rows - 1):
-                        target_top = max(0, row_index - max(1, visible_rows - 2))
-                        logger.info(
-                            f"Row {row_index + 1}: Adjusting topItem to avoid bottom edge "
-                            f"(view={actual_view_index} -> target_top={target_top})"
-                        )
-                        await self.set_grid_top_item(target_top)
-                        await asyncio.sleep(0.4)
-                        top_item = await self.get_grid_top_item()
-                        if top_item is not None:
-                            actual_view_index = row_index - top_item
-
-                if actual_view_index is not None:
-                    grid = self.get_canvas_grid()
-                    rel_y = await self._find_rel_y_for_row(row_index, actual_view_index)
-                    x = grid.x + 120
-                    y = grid.y + rel_y
-                    debug.click(
-                        x, y, f"row select (view {actual_view_index}, verified)"
-                    )
-                    logger.info(
-                        f"Clicking row select (view {actual_view_index}, verified) at ({x:.0f}, {y:.0f})"
-                    )
-                    await self.click_position(x, y)
-                    await asyncio.sleep(0.1)
-                    await self.click_plus_button_verified(
-                        row_index, view_index=actual_view_index
-                    )
-                else:
-                    await self.click_plus_button_api(row_index)
-
-                # Step 3: Wait for popup with extended timeout on retries
-                timeout = 5.0 + (attempt * 2.0)  # Longer timeout on retries
-                debug.action("STEP3", f"waiting for popup/warning (timeout={timeout}s)")
-                outcome = await self.wait_for_popup_or_warning(timeout=timeout)
-                if outcome == "warning":
-                    debug.error("Missing required fields warning detected")
-                    raise Exception("Missing required fields warning")
-                if outcome != "popup":
-                    debug.error("Popup did not open!")
-                    raise Exception("Popup did not open after click")
-
-                # Verify popup corresponds to target row (avoid wrong-row fill)
-                current_row = await self.get_grid_current_row()
-                if current_row is not None and current_row != row_index:
-                    logger.warning(
-                        f"Row {row_index + 1}: Popup opened on different row "
-                        f"(current={current_row + 1}). Retrying row focus."
-                    )
-                    await self.close_popup()
-                    await asyncio.sleep(0.2)
-
-                    retry_view_index = None
-                    if total_rows > 0:
-                        retry_view_index = await self.navigate_to_row(
-                            row_index, total_rows, visible_rows
-                        )
-                    if retry_view_index is None:
-                        retry_view_index = actual_view_index
-                    if retry_view_index is not None:
-                        await self.click_row_by_view(retry_view_index)
-                        await asyncio.sleep(0.1)
-                        await self.click_plus_button_verified(
-                            row_index, view_index=retry_view_index
-                        )
-                    else:
-                        await self.click_plus_button_api(row_index)
-
-                    outcome = await self.wait_for_popup_or_warning(timeout=3.0)
-                    if outcome == "warning":
-                        raise Exception("Missing required fields warning (retry)")
-                    if outcome != "popup":
-                        raise Exception("Popup did not open on retry")
-
-                    current_row = await self.get_grid_current_row()
-                    if current_row is not None and current_row != row_index:
-                        raise Exception(
-                            f"Popup opened on wrong row after retry (current={current_row + 1})"
-                        )
+                # Step 2: Navigate to row and open popup (shared helper)
+                debug.action("STEP2", "navigating to row and opening popup")
+                popup_timeout = 5.0 + (attempt * 2.0)  # Longer timeout on retries
+                popup_opened = await self._open_popup_for_row(row_index, popup_timeout=popup_timeout)
+                if not popup_opened:
+                    raise Exception("Failed to open popup for row")
 
                 # Step 4: Fill popup
                 debug.action("STEP4", "filling popup fields")

@@ -358,7 +358,6 @@ class ReceiptExtractor:
             '.png': 'image/png',
             '.gif': 'image/gif',
             '.webp': 'image/webp',
-            '.pdf': 'application/pdf',
         }
         media_type = media_types.get(suffix, 'image/jpeg')
         
@@ -393,7 +392,7 @@ class ReceiptExtractor:
                         "role": "user",
                         "content": [
                             {
-                                "type": "document" if media_type == "application/pdf" else "image",
+                                "type": "image",
                                 "source": {
                                     "type": "base64",
                                     "media_type": media_type,
@@ -719,8 +718,6 @@ class QwenReceiptExtractor:
         self.client = OCRClient(host=host, port=port, timeout=timeout)
 
     async def extract(self, image_path: str) -> ReceiptData:
-        if Path(image_path).suffix.lower() == '.pdf':
-            raise ValueError("Qwen2.5-VL does not support PDF files")
         logger.info(f"Extracting receipt data from: {image_path} (using Qwen2.5-VL API)")
 
         result = await asyncio.to_thread(
@@ -846,8 +843,8 @@ class ClaudeCodeReceiptExtractor:
         if not path.exists():
             raise FileNotFoundError(f"Image file not found: {image_path}")
         
-        # Build prompt
-        prompt = CLAUDE_CODE_EXTRACTION_PROMPT.format(image_path=image_path)
+        # Build prompt — use filename only (cwd is set to image directory)
+        prompt = CLAUDE_CODE_EXTRACTION_PROMPT.format(image_path=path.name)
         
         # Build command
         # Use --no-session-persistence to avoid cluttering the user's session history
@@ -855,20 +852,30 @@ class ClaudeCodeReceiptExtractor:
         if self.model:
             cmd.extend(["--model", self.model])
         
-        # Run Claude Code CLI
+        # Run Claude Code CLI (strip ALL CLAUDE* env vars to avoid nested-session block)
+        import os as _os
+        _env = {k: v for k, v in _os.environ.items()
+                if not k.startswith("CLAUDE")}
         try:
             result = subprocess.run(
                 cmd,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=self.timeout,
                 cwd=str(path.parent),  # Run from image directory
+                env=_env,
             )
             
             if result.returncode != 0:
                 logger.error(f"Claude Code CLI failed: {result.stderr}")
                 raise RuntimeError(f"Claude Code CLI error: {result.stderr}")
-            
+
+            if not result.stdout:
+                logger.error(f"Claude Code CLI returned empty stdout. stderr: {result.stderr}")
+                raise RuntimeError(f"Claude CLI returned empty output (stdout=None). This may indicate too many concurrent processes. stderr: {result.stderr}")
+
             # Parse the JSON output from Claude Code
             cli_output = json.loads(result.stdout)
             
@@ -876,7 +883,8 @@ class ClaudeCodeReceiptExtractor:
                 raise RuntimeError(f"Claude Code error: {cli_output.get('result', 'Unknown error')}")
             
             # Extract the actual result (which contains the receipt JSON)
-            response_text = cli_output.get("result", "")
+            # Use `or ""` because .get() returns None when key exists but value is None
+            response_text = cli_output.get("result") or ""
             logger.debug(f"Claude Code response: {response_text}")
             
             # Parse the nested JSON from the result
@@ -961,7 +969,7 @@ class OpenRouterReceiptExtractor:
 
         suffix = path.suffix.lower()
         mime_map = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
-                    ".gif": "image/gif", ".webp": "image/webp", ".pdf": "application/pdf"}
+                    ".gif": "image/gif", ".webp": "image/webp"}
         mime_type = mime_map.get(suffix, "image/jpeg")
 
         prompt_text = QWEN_RECEIPT_EXTRACTION_PROMPT  # Reuse the same extraction prompt
@@ -1054,7 +1062,6 @@ async def extract_receipt_from_text(
 
     # Resolve provider — text-only, so skip vision-only providers like Qwen
     if provider in ("auto", "qwen25vl"):
-        # Qwen is image-only; fall through to text-capable providers
         candidates = []
         if CLAUDE_CODE_AVAILABLE:
             candidates.append("claude_code")
@@ -1073,11 +1080,13 @@ async def extract_receipt_from_text(
     if provider == "claude_code":
         if not CLAUDE_CODE_AVAILABLE:
             raise RuntimeError("Claude Code CLI not found")
+        # Strip CLAUDE* env vars to avoid nested-session block
+        import os as _os
+        _env = {k: v for k, v in _os.environ.items() if not k.startswith("CLAUDE")}
         cmd = ["claude", "-p", prompt, "--output-format", "json",
                "--no-session-persistence", "--model", "sonnet"]
         result = await asyncio.to_thread(
-            subprocess.run, cmd, capture_output=True, text=True,
-            encoding="utf-8", errors="replace", timeout=30
+            subprocess.run, cmd, capture_output=True, text=True, timeout=30, env=_env
         )
         if result.returncode != 0:
             raise RuntimeError(f"Claude CLI error: {result.stderr[:200]}")
@@ -1094,8 +1103,7 @@ async def extract_receipt_from_text(
             raise RuntimeError("Gemini CLI not found")
         cmd = ["gemini", "-o", "json", prompt]
         result = await asyncio.to_thread(
-            subprocess.run, cmd, capture_output=True, text=True,
-            encoding="utf-8", errors="replace", timeout=30
+            subprocess.run, cmd, capture_output=True, text=True, timeout=30
         )
         if result.returncode != 0:
             raise RuntimeError(f"Gemini CLI error: {result.stderr[:200]}")

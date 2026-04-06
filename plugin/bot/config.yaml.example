@@ -20,7 +20,7 @@ providers:
   llm: claude_code
 
   # Receipt OCR provider
-  # Options: claude_code | gemini_cli | openrouter | auto
+  # Options: claude_code | gemini_cli | openrouter | qwen25vl | auto
   # claude_code uses the sonnet model by default (best accuracy/speed for OCR)
   receipt_ocr: claude_code
 

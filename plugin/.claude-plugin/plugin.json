@@ -1,9 +1,9 @@
 {
   "name": "douzonebot",
   "description": "더존 경비 자동화 도우미.",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "author": {
     "name": "Yeonghyeon Lee"
   },
-  "repository": "https://github.com/neosapience/douzonebot-plugin"
+  "repository": "https://github.com/neosapience/douzone-bot"
 }

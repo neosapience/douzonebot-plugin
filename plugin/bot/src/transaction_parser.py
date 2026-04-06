@@ -245,7 +245,7 @@ class TransactionParser:
         Args:
             page: Playwright page object (connected to Douzone)
             screenshot_dir: Directory to save screenshots
-            backend: Vision backend to use ("gemini" or "claude")
+            backend: Vision backend to use ("gemini", "claude", or "qwen25vl")
                      Default: "gemini" (more accurate for Korean OCR)
         """
         self.page = page
@@ -255,8 +255,24 @@ class TransactionParser:
         os.makedirs(screenshot_dir, exist_ok=True)
 
         # Validate backend
-        if self.backend not in ["gemini", "claude"]:
-            raise ValueError(f"Unsupported backend: {backend}. Use 'gemini' or 'claude'")
+        if self.backend not in ["gemini", "claude", "qwen25vl"]:
+            raise ValueError(f"Unsupported backend: {backend}. Use 'gemini', 'claude', or 'qwen25vl'")
+
+        # Initialize qwen25vl client if needed (server-mode only)
+        if self.backend == "qwen25vl":
+            try:
+                import socket
+                from ocr_api.client import OCRClient
+
+                # Quick reachability check (2 second timeout)
+                sock = socket.create_connection(("200.168.0.41", 8810), timeout=2)
+                sock.close()
+
+                self.ocr_client = OCRClient(host="200.168.0.41", port=8810, timeout=30)
+                logger.info("Initialized Qwen2.5-VL API client (200.168.0.41:8810)")
+            except (ImportError, OSError, socket.timeout, ConnectionRefusedError) as e:
+                logger.warning(f"Qwen2.5-VL not available ({e}), falling back to claude backend")
+                self.backend = "claude"
 
         logger.info(f"Using {self.backend.upper()} backend for vision parsing")
 
@@ -549,6 +565,8 @@ Return ONLY a JSON array of objects, no explanation."""
             try:
                 if primary_backend == "gemini":
                     response_text = await self._parse_with_gemini(screenshot_path, prompt)
+                elif primary_backend == "qwen25vl":
+                    response_text = await self._parse_with_qwen25vl(screenshot_path, prompt)
                 else:  # claude
                     response_text = await self._parse_with_claude(screenshot_path, prompt)
 
@@ -564,8 +582,8 @@ Return ONLY a JSON array of objects, no explanation."""
                     # Max retries reached - try fallback
                     logger.error(f"{primary_backend.upper()} failed after {max_retries+1} attempts: {str(e)[:100]}")
 
-                    # Fallback to Claude if Gemini fails
-                    if primary_backend == "gemini":
+                    # Fallback to Claude if Gemini/Qwen fails
+                    if primary_backend in ["gemini", "qwen25vl"]:
                         logger.warning(f"Falling back to CLAUDE for {filename}")
                         try:
                             response_text = await self._parse_with_claude(screenshot_path, prompt)
@@ -700,6 +718,21 @@ Return ONLY a JSON array of objects, no explanation."""
 
         # Normalize amount strings to integers (Gemini returns "3,500" format)
         return response
+
+    async def _parse_with_qwen25vl(self, screenshot_path: str, prompt: str) -> str:
+        """Parse screenshot using Qwen2.5-VL API."""
+        # Remove the "Read the file {filename}. " prefix as API doesn't need it
+        # The prompt already contains the rest of the instructions
+        if "Read the file " in prompt:
+            prompt = prompt.split(". ", 1)[1] if ". " in prompt else prompt
+
+        result = self.ocr_client.ocr(screenshot_path, prompt=prompt)
+
+        if not result["success"]:
+            raise Exception(f"Qwen2.5-VL API error: {result.get('error', 'Unknown error')}")
+
+        logger.info(f"Qwen2.5-VL latency: {result['latency_ms']:.0f}ms")
+        return result["text"]
 
     async def capture_single_screenshot(self) -> str:
         """Capture a single screenshot of current view."""

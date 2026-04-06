@@ -190,6 +190,7 @@ async def run_mvp_mode(args, config: AppConfig = None):
         stage3_cache_out=getattr(args, 'stage3_cache_out', None),
         stage3_only=getattr(args, 'stage3_only', False),
         review_only=getattr(args, 'review_only', False),
+        skip_post_verify=getattr(args, 'skip_post_verify', False),
         provider=provider,
     )
     
@@ -995,6 +996,11 @@ Receipt OCR only (debug only):
         "--skip-preflight",
         action="store_true",
         help="Skip pre-flight API availability checks"
+    )
+    parser.add_argument(
+        "--skip-post-verify",
+        action="store_true",
+        help="Skip post-verification checks after automation"
     )
     parser.add_argument(
         "--preflight-only",

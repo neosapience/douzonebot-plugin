@@ -21,7 +21,10 @@ from typing import List, Optional, Dict, Any, Tuple
 from pathlib import Path
 from datetime import datetime
 
-from .models import ExpenseData, ExecutionPlan, RowAction, ActionType, ExecutionStatus
+from .models import (
+    ExpenseData, ExecutionPlan, RowAction, ActionType, ExecutionStatus,
+    VerificationIssue, VerificationIssueType, PostVerificationResult,
+)
 from .automation import DouzoneAutomation
 from .transaction_parser import TransactionParser, Transaction, TransactionList
 from .pipeline import parse_memo, MemoData
@@ -335,6 +338,7 @@ class MVPOrchestrator:
         self.stage2_only = False  # Will be set by run_mvp if needed
         self.stage3_only = False  # Will be set by run_mvp if needed
         self.review_only = False  # Will be set by run_mvp if needed
+        self.skip_post_verify = False  # Will be set by run_mvp if needed
         
         # Data stores
         self.transactions: Optional[TransactionList] = None
@@ -1341,6 +1345,7 @@ class MVPOrchestrator:
             "supplier_biz_no": expense.supplier_biz_no,
             "receipt_paths": expense.receipt_paths,
             "pending_reason": expense.pending_reason,
+            "bigo_notes": expense.bigo_notes,
             "needs_yongdo": expense.needs_yongdo,
             "needs_content": expense.needs_content,
         }
@@ -1849,7 +1854,11 @@ class MVPOrchestrator:
 
     def _might_need_receipt(self, merchant: str) -> bool:
         """Check if a merchant might need receipt attachment."""
-        return self._is_pg_merchant(merchant) or self._is_saas_merchant(merchant)
+        return (
+            self._is_pg_merchant(merchant)
+            or self._is_saas_merchant(merchant)
+            or self._requires_receipt_attachment(merchant)
+        )
 
     def _determine_yongdo(self, tx: Transaction, receipt_time: Optional[str] = None) -> str:
         """
@@ -2467,6 +2476,7 @@ class MVPOrchestrator:
             supplier_biz_no=fd.get("supplier_biz_no"),
             receipt_paths=fd.get("receipt_paths") or ([fd["receipt_path"]] if fd.get("receipt_path") else []),
             pending_reason=fd.get("pending_reason"),
+            bigo_notes=row_action.bigo_notes or [],
             needs_yongdo=bool(needs_yongdo),
             needs_content=bool(needs_content),
         )
@@ -2630,6 +2640,10 @@ class MVPOrchestrator:
                 if result:
                     row.execution_status = ExecutionStatus.SUCCESS.value
                     row.execution_error = None
+                    # Track which receipts actually attached (for post-verification)
+                    attached = getattr(expense_data, '_attached_receipts', None)
+                    if attached is not None and row.fill_data:
+                        row.fill_data['attached_receipts'] = attached
                 else:
                     row.execution_status = ExecutionStatus.FAILED.value
                     err = getattr(self.automation, "last_error", None)
@@ -2685,9 +2699,555 @@ class MVPOrchestrator:
         }
     
     # =========================================================================
+    # STAGE 5: POST-VERIFICATION
+    # =========================================================================
+
+    # Parking keywords for detection
+    PARKING_KEYWORDS = ['주차', '주차장', '주차비', '파킹', 'parking']
+    PARKING_CAP = 200000  # 200,000원
+
+    def _parse_amount(self, amount_str) -> Optional[int]:
+        """Parse amount from various formats to integer (won)."""
+        if amount_str is None:
+            return None
+        if isinstance(amount_str, (int, float)):
+            return int(amount_str)
+        s = str(amount_str).strip()
+        # Remove currency markers and commas
+        s = s.replace('원', '').replace('₩', '').replace(',', '').replace(' ', '')
+        # Handle parentheses as negative: (50000) -> -50000
+        if s.startswith('(') and s.endswith(')'):
+            s = '-' + s[1:-1]
+        try:
+            return int(float(s))
+        except (ValueError, TypeError):
+            return None
+
+    def _tokenize_merchant(self, merchant: str) -> List[str]:
+        """Tokenize merchant name for fuzzy matching.
+        Min length 2 to handle short Korean names like 배민, 토스."""
+        import re
+        tokens = re.split(r'[\s\-\/\(\)\[\]]+', merchant.strip().lower())
+        return [t for t in tokens if len(t) >= 2]
+
+    def _merchants_match(self, a: str, b: str) -> bool:
+        """Check if two merchant names match using shared-keyword substring matching."""
+        tokens_a = self._tokenize_merchant(a)
+        tokens_b = self._tokenize_merchant(b)
+        if not tokens_a or not tokens_b:
+            return a.strip().lower() == b.strip().lower()
+        for ta in tokens_a:
+            for tb in tokens_b:
+                if ta in tb or tb in ta:
+                    return True
+        return False
+
+    def _is_parking_transaction(self, row: 'RowAction') -> bool:
+        """Check if a row is a parking transaction."""
+        fields_to_check = []
+        txn = row.transaction or {}
+        fields_to_check.append(txn.get('merchant', ''))
+        if row.fill_data:
+            fields_to_check.append(row.fill_data.get('yongdo', ''))
+            fields_to_check.append(row.fill_data.get('content', ''))
+        combined = ' '.join(fields_to_check).lower()
+        return any(kw in combined for kw in self.PARKING_KEYWORDS)
+
+    def _check_pg_missing_receipts(self, plan: ExecutionPlan) -> List['VerificationIssue']:
+        """Check for rows that need receipts but don't have them (PG, SaaS, large malls)."""
+        # Uses VerificationIssue, VerificationIssueType from top-level import
+        issues = []
+        for row in plan.rows:
+            if row.execution_status != ExecutionStatus.SUCCESS.value:
+                continue
+            merchant = (row.transaction or {}).get('merchant', '')
+            if not self._might_need_receipt(merchant):
+                continue
+            fill = row.fill_data or {}
+            attached = fill.get('attached_receipts')
+            if attached is not None:
+                # Use explicit tracking from Stage 4
+                has_valid_receipts = len(attached) > 0
+            else:
+                # Fallback for plans without tracking (e.g., loaded from old cache)
+                receipt_paths = fill.get('receipt_paths', [])
+                has_valid_receipts = bool(receipt_paths)
+            if not has_valid_receipts:
+                amount = self._parse_amount((row.transaction or {}).get('amount')) or 0
+                issues.append(VerificationIssue(
+                    issue_type=VerificationIssueType.PG_MISSING_RECEIPT.value,
+                    row_numbers=[row.row_number],
+                    merchant=merchant,
+                    amount=amount,
+                    description=f"PG 거래 ({merchant}) 영수증 미첨부 — 실공급자 확인을 위해 영수증 필수",
+                ))
+        return issues
+
+    def _check_pg_missing_supplier(self, plan: ExecutionPlan) -> List['VerificationIssue']:
+        """Check for PG merchant rows missing supplier info."""
+        # Uses VerificationIssue, VerificationIssueType from top-level import
+        issues = []
+        for row in plan.rows:
+            if row.execution_status != ExecutionStatus.SUCCESS.value:
+                continue
+            merchant = (row.transaction or {}).get('merchant', '')
+            if not self._is_pg_merchant(merchant):
+                continue
+            fill = row.fill_data or {}
+            supplier_name = fill.get('supplier_name', '')
+            supplier_biz_no = fill.get('supplier_biz_no', '')
+            if not supplier_name or not supplier_biz_no:
+                amount = self._parse_amount((row.transaction or {}).get('amount')) or 0
+                missing = []
+                if not supplier_name:
+                    missing.append('실공급자상호')
+                if not supplier_biz_no:
+                    missing.append('실공급자번호')
+                issues.append(VerificationIssue(
+                    issue_type=VerificationIssueType.PG_MISSING_SUPPLIER.value,
+                    row_numbers=[row.row_number],
+                    merchant=merchant,
+                    amount=amount,
+                    description=f"PG 거래 ({merchant}) {', '.join(missing)} 누락",
+                ))
+        return issues
+
+    def _check_charge_cancel_pairs(self, plan: ExecutionPlan) -> List['VerificationIssue']:
+        """Check for charge+cancellation pairs submitted incorrectly."""
+        # Uses VerificationIssue, VerificationIssueType from top-level import
+        issues = []
+        # Collect all rows with parsed amounts and dates
+        parsed_rows = []
+        for row in plan.rows:
+            txn = row.transaction or {}
+            amount = self._parse_amount(txn.get('amount'))
+            if amount is None:
+                continue
+            date_str = txn.get('date', '') or txn.get('date_time', '') or ''
+            # Extract date part (first 10 chars for YYYY-MM-DD or similar)
+            date_str = date_str[:10].strip()
+            parsed_rows.append({
+                'row': row,
+                'merchant': txn.get('merchant', ''),
+                'amount': amount,
+                'date_str': date_str,
+            })
+
+        # Find charge+cancel pairs
+        matched_indices = set()
+        for i, a in enumerate(parsed_rows):
+            if i in matched_indices:
+                continue
+            if a['amount'] >= 0:
+                continue  # Look for negative (cancel) rows first
+            for j, b in enumerate(parsed_rows):
+                if j in matched_indices or j == i:
+                    continue
+                if b['amount'] <= 0:
+                    continue  # b should be the charge (positive)
+                # Check: same |amount|
+                if abs(a['amount']) != abs(b['amount']):
+                    continue
+                # Check: merchants match (fuzzy)
+                if not self._merchants_match(a['merchant'], b['merchant']):
+                    continue
+                # Check: dates within 2 days
+                try:
+                    from datetime import datetime as _dt, timedelta
+                    date_a = date_b = None
+                    for fmt in ('%Y-%m-%d', '%Y.%m.%d', '%Y/%m/%d'):
+                        try:
+                            date_a = _dt.strptime(a['date_str'], fmt).date()
+                            break
+                        except ValueError:
+                            continue
+                    for fmt in ('%Y-%m-%d', '%Y.%m.%d', '%Y/%m/%d'):
+                        try:
+                            date_b = _dt.strptime(b['date_str'], fmt).date()
+                            break
+                        except ValueError:
+                            continue
+                    if date_a and date_b and abs((date_a - date_b).days) > 2:
+                        continue
+                except (ValueError, TypeError):
+                    # Date parse failed — skip date check, match on amount+merchant only
+                    pass
+
+                # Found a pair: check if only one side was submitted
+                cancel_row = a['row']
+                charge_row = b['row']
+                cancel_submitted = cancel_row.execution_status == ExecutionStatus.SUCCESS.value
+                charge_submitted = charge_row.execution_status == ExecutionStatus.SUCCESS.value
+
+                # Only flag when exactly one side was submitted (asymmetric)
+                # Both submitted or both skipped are valid states per spec
+                if cancel_submitted != charge_submitted:
+                    submitted_side = "취소분" if cancel_submitted else "결제분"
+                    desc = f"결제+취소 쌍 중 {submitted_side}만 제출됨 ({b['merchant']} {abs(b['amount']):,}원)"
+                    issues.append(VerificationIssue(
+                        issue_type=VerificationIssueType.CHARGE_CANCEL_PAIR.value,
+                        row_numbers=[charge_row.row_number],
+                        paired_row_number=cancel_row.row_number,
+                        merchant=b['merchant'],
+                        amount=abs(b['amount']),
+                        description=desc,
+                    ))
+                    matched_indices.add(i)
+                    matched_indices.add(j)
+                    break
+        return issues
+
+    def _check_parking_cap(self, plan: ExecutionPlan) -> List['VerificationIssue']:
+        """Check for parking transactions exceeding 200,000원 cap."""
+        # Uses VerificationIssue, VerificationIssueType from top-level import
+        issues = []
+        for row in plan.rows:
+            if row.execution_status != ExecutionStatus.SUCCESS.value:
+                continue
+            if not self._is_parking_transaction(row):
+                continue
+            amount = self._parse_amount((row.transaction or {}).get('amount')) or 0
+            if amount > self.PARKING_CAP:
+                merchant = (row.transaction or {}).get('merchant', '')
+                excess = amount - self.PARKING_CAP
+                issues.append(VerificationIssue(
+                    issue_type=VerificationIssueType.PARKING_OVER_CAP.value,
+                    row_numbers=[row.row_number],
+                    merchant=merchant,
+                    amount=amount,
+                    description=f"주차비 {amount:,}원 > 한도 {self.PARKING_CAP:,}원 (초과: {excess:,}원)",
+                ))
+        return issues
+
+    def _scan_all_issues(self, plan: ExecutionPlan) -> List['VerificationIssue']:
+        """Run all post-verification checks and return sorted issues."""
+        issues = []
+        issues.extend(self._check_pg_missing_receipts(plan))
+        issues.extend(self._check_pg_missing_supplier(plan))
+        issues.extend(self._check_charge_cancel_pairs(plan))
+        issues.extend(self._check_parking_cap(plan))
+        issues.sort(key=lambda i: i.row_numbers[0])
+        return issues
+
+    def _print_verification_report(self, issues: List['VerificationIssue']) -> None:
+        """Print grouped post-verification report."""
+        from .models import VerificationIssueType
+        print("\n" + "=" * 60)
+        print("🔍 STAGE 6: Post-Verification")
+        print("=" * 60)
+
+        if not issues:
+            print("\n✅ Post-verification passed — no issues found.")
+            return
+
+        print(f"\n⚠️  Found {len(issues)} issue(s):\n")
+
+        # Group by type
+        groups = {}
+        for issue in issues:
+            groups.setdefault(issue.issue_type, []).append(issue)
+
+        type_labels = {
+            VerificationIssueType.PG_MISSING_RECEIPT.value: "📎 PG 거래 영수증 누락",
+            VerificationIssueType.PG_MISSING_SUPPLIER.value: "🏢 PG 거래 실공급자 정보 누락",
+            VerificationIssueType.CHARGE_CANCEL_PAIR.value: "🔄 결제+취소 쌍 불일치",
+            VerificationIssueType.PARKING_OVER_CAP.value: "🅿️ 주차비 한도 초과",
+        }
+
+        for issue_type, group_issues in groups.items():
+            label = type_labels.get(issue_type, issue_type)
+            print(f"  {label} ({len(group_issues)}건)")
+            for issue in group_issues:
+                rows_str = ", ".join(str(r) for r in issue.row_numbers)
+                if issue.paired_row_number:
+                    rows_str += f" + {issue.paired_row_number}"
+                print(f"    Row {rows_str}: {issue.description}")
+            print()
+
+    async def _prompt_fix_receipt(self, issue: 'VerificationIssue', plan: ExecutionPlan) -> None:
+        """Interactive fix for missing PG receipt."""
+        row_num = issue.row_numbers[0]
+        print(f"\n  📎 Row {row_num}: {issue.merchant} — 영수증 누락")
+        response = input("     영수증 파일 경로 입력 (또는 's' = skip): ").strip()
+
+        if response.lower() == 's' or not response:
+            issue.resolved = True
+            issue.resolution = "skipped"
+            print("     → 건너뜀")
+            return
+
+        # Validate file exists
+        if not os.path.exists(response):
+            print(f"     ❌ 파일 없음: {response}")
+            issue.resolved = True
+            issue.resolution = "file_not_found"
+            return
+
+        # Open popup and attach
+        idx = row_num - 1
+        popup_ok = await self.automation._open_popup_for_row(idx)
+        if not popup_ok:
+            print("     ❌ 팝업 열기 실패")
+            issue.resolved = True
+            issue.resolution = "popup_open_failed"
+            return
+
+        attached = await self.automation.attach_file(response)
+        if not attached:
+            print("     ❌ 파일 첨부 실패")
+            await self.automation.cancel_popup()
+            issue.resolved = True
+            issue.resolution = "attach_failed"
+            return
+
+        saved = await self.automation.save_popup()
+        if not saved:
+            print("     ❌ 저장 실패")
+            issue.resolved = True
+            issue.resolution = "save_failed"
+            return
+
+        # Update fill_data
+        for row in plan.rows:
+            if row.row_number == row_num and row.fill_data:
+                paths = row.fill_data.get('receipt_paths', [])
+                paths.append(response)
+                row.fill_data['receipt_paths'] = paths
+                break
+
+        issue.resolved = True
+        issue.resolution = "fixed"
+        print("     ✅ 영수증 첨부 완료")
+
+    async def _prompt_fix_supplier(self, issue: 'VerificationIssue', plan: ExecutionPlan) -> None:
+        """Interactive fix for missing supplier info."""
+        row_num = issue.row_numbers[0]
+        print(f"\n  🏢 Row {row_num}: {issue.merchant} — 실공급자 정보 누락")
+
+        # Check if row has receipt for OCR retry
+        target_row = None
+        for row in plan.rows:
+            if row.row_number == row_num:
+                target_row = row
+                break
+
+        supplier_name = None
+        supplier_biz_no = None
+        receipt_paths = (target_row.fill_data or {}).get('receipt_paths', []) if target_row else []
+        valid_receipts = [p for p in receipt_paths if os.path.exists(p)]
+
+        if valid_receipts:
+            response = input("     영수증에서 OCR 재시도? (y/n/직접입력): ").strip()
+            if response.lower() == 'y':
+                try:
+                    from .pipeline import extract_supplier_info
+                    supplier_name, supplier_biz_no = await extract_supplier_info(valid_receipts[0])
+                    if supplier_name:
+                        print(f"     OCR 결과: {supplier_name} / {supplier_biz_no or 'N/A'}")
+                except Exception as e:
+                    print(f"     OCR 실패: {e}")
+
+        if not supplier_name:
+            supplier_name = input("     실공급자상호 입력 (또는 's' = skip): ").strip()
+            if supplier_name.lower() == 's' or not supplier_name:
+                issue.resolved = True
+                issue.resolution = "skipped"
+                print("     → 건너뜀")
+                return
+            supplier_biz_no = input("     실공급자 사업자번호 입력: ").strip()
+
+        # Open popup and fill
+        idx = row_num - 1
+        popup_ok = await self.automation._open_popup_for_row(idx)
+        if not popup_ok:
+            print("     ❌ 팝업 열기 실패")
+            issue.resolved = True
+            issue.resolution = "popup_open_failed"
+            return
+
+        # Fill supplier fields
+        try:
+            if supplier_name:
+                supplier_input = self.automation.page.locator(
+                    'input[placeholder*="실공급자상호"]'
+                ).first
+                if await supplier_input.is_visible():
+                    await supplier_input.fill(supplier_name)
+            if supplier_biz_no:
+                biz_input = self.automation.page.locator(
+                    'input[placeholder*="사업자등록번호"]'
+                ).first
+                if await biz_input.is_visible():
+                    await biz_input.fill(supplier_biz_no)
+        except Exception as e:
+            print(f"     ❌ 필드 입력 실패: {e}")
+            await self.automation.cancel_popup()
+            issue.resolved = True
+            issue.resolution = "fill_failed"
+            return
+
+        saved = await self.automation.save_popup()
+        if not saved:
+            print("     ❌ 저장 실패")
+            issue.resolved = True
+            issue.resolution = "save_failed"
+            return
+
+        # Update fill_data
+        if target_row and target_row.fill_data:
+            target_row.fill_data['supplier_name'] = supplier_name
+            target_row.fill_data['supplier_biz_no'] = supplier_biz_no
+
+        issue.resolved = True
+        issue.resolution = "fixed"
+        print(f"     ✅ 실공급자 정보 입력 완료: {supplier_name} / {supplier_biz_no}")
+
+    async def _prompt_fix_pair(self, issue: 'VerificationIssue', plan: ExecutionPlan) -> None:
+        """Interactive fix for charge+cancel pair."""
+        charge_row = issue.row_numbers[0]
+        cancel_row = issue.paired_row_number
+        print(f"\n  🔄 Row {charge_row} + {cancel_row}: {issue.merchant} — 결제+취소 쌍 ({issue.amount:,}원)")
+        print(f"     현재: 한쪽만 제출됨")
+        response = input("     [s] 둘 다 건너뛰기 (기본) / [b] 둘 다 제출 / [i] 무시: ").strip().lower()
+
+        if response == 'b':
+            issue.resolved = True
+            issue.resolution = "submit_both"
+            print("     → 둘 다 제출 (수동 확인 필요)")
+        elif response == 'i':
+            issue.resolved = True
+            issue.resolution = "ignored"
+            print("     → 무시")
+        else:
+            issue.resolved = True
+            issue.resolution = "skip_both"
+            print("     → 둘 다 건너뛰기 (기본)")
+
+    async def _prompt_fix_parking(self, issue: 'VerificationIssue', plan: ExecutionPlan) -> None:
+        """Interactive fix for parking cap overage."""
+        row_num = issue.row_numbers[0]
+        excess = issue.amount - self.PARKING_CAP
+        print(f"\n  🅿️ Row {row_num}: {issue.merchant} — 주차비 {issue.amount:,}원 (한도 초과 {excess:,}원)")
+        response = input("     [a] 금액 수정 / [s] 건너뛰기 / [k] 초과 인정: ").strip().lower()
+
+        if response == 'a':
+            new_amount = input(f"     수정 금액 입력 (현재: {issue.amount:,}원): ").strip()
+            parsed = self._parse_amount(new_amount)
+            if parsed is None or parsed <= 0:
+                print("     ❌ 잘못된 금액")
+                issue.resolved = True
+                issue.resolution = "invalid_amount"
+                return
+
+            idx = row_num - 1
+            popup_ok = await self.automation._open_popup_for_row(idx)
+            if not popup_ok:
+                print("     ❌ 팝업 열기 실패")
+                issue.resolved = True
+                issue.resolution = "popup_open_failed"
+                return
+
+            # Try to find and fill the amount field
+            try:
+                amount_input = self.automation.page.locator(
+                    'input[placeholder*="금액"]'
+                ).first
+                if await amount_input.is_visible():
+                    await amount_input.fill(str(parsed))
+            except Exception as e:
+                print(f"     ❌ 금액 수정 실패: {e}")
+                await self.automation.close_popup()
+                issue.resolved = True
+                issue.resolution = "fill_failed"
+                return
+
+            saved = await self.automation.save_popup()
+            if not saved:
+                print("     ❌ 저장 실패")
+                issue.resolved = True
+                issue.resolution = "save_failed"
+                return
+
+            issue.resolved = True
+            issue.resolution = f"adjusted_to_{parsed}"
+            print(f"     ✅ 금액 수정 완료: {parsed:,}원")
+        elif response == 'k':
+            issue.resolved = True
+            issue.resolution = "acknowledged"
+            print("     → 초과 인정")
+        else:
+            issue.resolved = True
+            issue.resolution = "skipped"
+            print("     → 건너뜀")
+
+    async def post_verify(self, plan: ExecutionPlan) -> 'PostVerificationResult':
+        """
+        Run post-verification scan on completed execution plan.
+        Detects issues, prints report, offers interactive fixes.
+        """
+        # Uses PostVerificationResult, VerificationIssueType from top-level import
+
+        result = PostVerificationResult(
+            started_at=datetime.now().isoformat(),
+        )
+
+        # Scan for issues
+        issues = self._scan_all_issues(plan)
+        result.issues = issues
+        result.total_issues = len(issues)
+        result.passed = len(issues) == 0
+
+        # Print report
+        self._print_verification_report(issues)
+
+        # Interactive fixes (if any issues)
+        # Note: auto_approve does NOT suppress post-verify prompts.
+        # Use --skip-post-verify to skip the entire stage instead.
+        if issues:
+            print(f"\n{'─'*40}")
+            print("🔧 Interactive Fix")
+            print(f"{'─'*40}")
+
+            fix_handlers = {
+                VerificationIssueType.PG_MISSING_RECEIPT.value: self._prompt_fix_receipt,
+                VerificationIssueType.PG_MISSING_SUPPLIER.value: self._prompt_fix_supplier,
+                VerificationIssueType.CHARGE_CANCEL_PAIR.value: self._prompt_fix_pair,
+                VerificationIssueType.PARKING_OVER_CAP.value: self._prompt_fix_parking,
+            }
+
+            for issue in issues:
+                handler = fix_handlers.get(issue.issue_type)
+                if handler:
+                    try:
+                        await handler(issue, plan)
+                    except (KeyboardInterrupt, EOFError):
+                        print("\n     → 중단됨")
+                        break
+                    except Exception as e:
+                        logger.error(f"Fix handler error for row {issue.row_numbers}: {e}")
+                        issue.resolved = True
+                        issue.resolution = f"error: {e}"
+
+                # Save after each fix
+                if self.execution_plan_path:
+                    plan.post_verification = result.to_dict()
+                    with open(self.execution_plan_path, "w", encoding="utf-8") as f:
+                        json.dump(plan.to_dict(), f, ensure_ascii=False, indent=2)
+        result.resolved_issues = sum(1 for i in issues if i.resolved and i.resolution == "fixed")
+        result.completed_at = datetime.now().isoformat()
+
+        # Persist final results
+        plan.post_verification = result.to_dict()
+        if self.execution_plan_path:
+            with open(self.execution_plan_path, "w", encoding="utf-8") as f:
+                json.dump(plan.to_dict(), f, ensure_ascii=False, indent=2)
+
+        return result
+
+    # =========================================================================
     # MAIN RUNNER
     # =========================================================================
-    
+
     async def run(self, skip_transactions: bool = False) -> Dict[str, Any]:
         """
         Run the complete MVP flow.
@@ -2714,11 +3274,22 @@ class MVPOrchestrator:
                     print("\n⚠️ Test mode: Skipping actual automation")
                     return {"test_mode": True, "execution_plan": self.execution_plan}
                 result = await self.execute()
+
+                # Post-verification
+                pv_summary = ""
+                if not self.skip_post_verify and result.get("success", 0) > 0:
+                    pv_result = await self.post_verify(self.execution_plan)
+                    result["post_verification"] = pv_result.to_dict()
+                    if pv_result.total_issues > 0:
+                        pv_summary = f" | Post-verify: {pv_result.resolved_issues}/{pv_result.total_issues} resolved"
+                    else:
+                        pv_summary = " | Post-verify: passed"
+
                 print("\n" + "="*60)
                 if result["success"] == result["total"]:
-                    print("🎉 ALL DONE! Expense claim automation complete.")
+                    print(f"🎉 ALL DONE! Expense claim automation complete.{pv_summary}")
                 else:
-                    print("⚠️ Completed with some failures. Check logs.")
+                    print(f"⚠️ Completed with some failures. Check logs.{pv_summary}")
                 print("="*60)
                 return result
 
@@ -2776,15 +3347,25 @@ class MVPOrchestrator:
             
             result = await self.execute()
 
+            # Post-verification
+            pv_summary = ""
+            if not self.skip_post_verify and result.get("success", 0) > 0:
+                pv_result = await self.post_verify(self.execution_plan)
+                result["post_verification"] = pv_result.to_dict()
+                if pv_result.total_issues > 0:
+                    pv_summary = f" | Post-verify: {pv_result.resolved_issues}/{pv_result.total_issues} resolved"
+                else:
+                    pv_summary = " | Post-verify: passed"
+
             success = result.get("success", 0)
             total = result.get("total", 0)
             failed = total - success
 
             sys.stderr.write("\n" + "="*60 + "\n")
             if success == total:
-                sys.stderr.write("🎉 ALL DONE! Expense claim automation complete.\n")
+                sys.stderr.write(f"🎉 ALL DONE! Expense claim automation complete.{pv_summary}\n")
             else:
-                sys.stderr.write("⚠️ Completed with some failures. Check logs.\n")
+                sys.stderr.write(f"⚠️ Completed with some failures. Check logs.{pv_summary}\n")
             sys.stderr.write("="*60 + "\n")
 
             # Machine-parseable summary
@@ -2915,6 +3496,7 @@ async def run_mvp(
     stage3_cache_out: Optional[str] = None,
     stage3_only: bool = False,
     review_only: bool = False,
+    skip_post_verify: bool = False,
     provider=None,
 ) -> Dict[str, Any]:
     """
@@ -2942,6 +3524,7 @@ async def run_mvp(
         stage3_cache_out: Save Stage 3 reviewed plan to this path (debug only)
         stage3_only: Stop after Stage 3 review (debug only)
         review_only: Display review without prompts or execution
+        skip_post_verify: Skip post-verification stage
 
     Returns:
         Result dictionary
@@ -2980,5 +3563,6 @@ async def run_mvp(
     orchestrator.stage2_only = stage2_only
     orchestrator.stage3_only = stage3_only
     orchestrator.review_only = review_only
+    orchestrator.skip_post_verify = skip_post_verify
 
     return await orchestrator.run(skip_transactions=test_mode)
