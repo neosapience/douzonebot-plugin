@@ -642,7 +642,7 @@ class MVPOrchestrator:
                     "reason": f"Progressive match: score {best_score}"
                 })
 
-                if receipt.vendor_info and self._is_pg_merchant(best_row.transaction.merchant):
+                if receipt.vendor_info:
                     best_row.supplier_name = receipt.vendor_info.name
                     best_row.supplier_biz_no = receipt.vendor_info.biz_num
 
@@ -838,15 +838,33 @@ class MVPOrchestrator:
             nonlocal cache_hits, cache_misses
             filename = os.path.basename(path)
 
-            # Check cache first (by filename)
+            # Check cache first (by filename — use original name before HEIC conversion)
             if filename in receipt_cache_data:
                 cache_hits += 1
                 cached_entry = receipt_cache_data[filename]
                 receipt_data = self._receipt_from_cache(cached_entry)
                 return {"index": index, "path": path, "data": receipt_data, "from_cache": True}
 
-            # Check for pre-prepared OCR companion file
-            preocr_path = find_preocr_file(path)
+            # Resolve HEIC → JPG upfront so all downstream lookups (preocr, OCR) use the JPG path.
+            # Claude CLI cannot read HEIC directly — always operate on the converted JPG if available.
+            resolved_path = path
+            if is_heic_file(path):
+                try:
+                    converted_dir = os.path.join(self.receipts_path, "converted")
+                    os.makedirs(converted_dir, exist_ok=True)
+                    jpg_path = os.path.join(converted_dir, os.path.splitext(filename)[0] + ".jpg")
+                    if not os.path.exists(jpg_path):
+                        jpg_path = convert_image(path, converted_dir)
+                    resolved_path = jpg_path
+                    logger.info(f"HEIC resolved to JPG: {path} -> {resolved_path}")
+                except Exception as e:
+                    return {"index": index, "path": path, "error": f"HEIC conversion failed: {e}"}
+
+            # Check for pre-prepared OCR companion file (next to JPG or HEIC)
+            preocr_path = find_preocr_file(resolved_path)
+            if not preocr_path and resolved_path != path:
+                # Also check next to the original HEIC path
+                preocr_path = find_preocr_file(path)
             if preocr_path:
                 try:
                     ocr_text = Path(preocr_path).read_text(encoding='utf-8-sig')
@@ -876,18 +894,9 @@ class MVPOrchestrator:
 
             cache_misses += 1
             async with semaphore:
-                receipt_path = path
-                try:
-                    if is_heic_file(receipt_path):
-                        converted_dir = os.path.join(self.receipts_path, "converted")
-                        os.makedirs(converted_dir, exist_ok=True)
-                        jpg_path = os.path.join(converted_dir, os.path.splitext(filename)[0] + ".jpg")
-
-                        if not os.path.exists(jpg_path):
-                            jpg_path = convert_image(receipt_path, converted_dir)
-                        receipt_path = jpg_path
-                except Exception as e:
-                    return {"index": index, "path": path, "error": f"Image conversion failed: {e}"}
+                # HEIC was already resolved to JPG at the top of process_one.
+                # Use resolved_path for the actual OCR call.
+                receipt_path = resolved_path
 
                 # Retry with backoff for rate limits, timeouts, and transient errors
                 max_attempts = 4
@@ -1692,7 +1701,7 @@ class MVPOrchestrator:
 
                 if found_receipt:
                     if found_path not in row.receipt_paths: row.receipt_paths.append(found_path)
-                    if found_receipt.vendor_info and self._is_pg_merchant(tx.merchant):
+                    if found_receipt.vendor_info:
                         row.supplier_name = found_receipt.vendor_info.name
                         row.supplier_biz_no = found_receipt.vendor_info.biz_num
                     print(f"   Row {idx+1}: Receipt matched ({receipt_match.confidence:.2f}) → {row.supplier_name or 'N/A'}")
@@ -2080,9 +2089,9 @@ class MVPOrchestrator:
 
             expense_data = row.to_expense_data()
             fill_data = self._expense_data_to_dict(expense_data)
-            if not self._is_pg_merchant(tx.merchant):
-                fill_data["supplier_name"] = None
-                fill_data["supplier_biz_no"] = None
+            # Supplier info is preserved for all merchants (not just PG) if OCR extracted it.
+            # The popup's 실공급자 fields are only visible/writable when the merchant type
+            # requires them, so fill_popup's is_visible() check handles the rest.
 
             bigo_notes: List[str] = []
             if row.pending_reason:
@@ -3200,10 +3209,21 @@ class MVPOrchestrator:
         # Print report
         self._print_verification_report(issues)
 
-        # Interactive fixes (if any issues)
-        # Note: auto_approve does NOT suppress post-verify prompts.
-        # Use --skip-post-verify to skip the entire stage instead.
-        if issues:
+        # Interactive fixes (only if stdin is a TTY)
+        # When running non-interactively (e.g., agent-driven via /douzonebot:go),
+        # skip prompts — the agent reads the report and can use operations.py
+        # (attach_receipt, fill_supplier, edit_row) to fix issues conversationally.
+        # Use --skip-post-verify to skip the entire stage.
+        is_interactive = sys.stdin.isatty()
+        if issues and not is_interactive:
+            print(f"\n{'─'*40}")
+            print("   비대화형 모드: 수정 프롬프트 생략")
+            print(f"   에이전트가 위 리포트를 읽고 operations.py로 수정할 수 있습니다.")
+            print(f"{'─'*40}")
+            for issue in issues:
+                issue.resolved = False
+                issue.resolution = "non_interactive_skip"
+        elif issues:
             print(f"\n{'─'*40}")
             print("🔧 Interactive Fix")
             print(f"{'─'*40}")

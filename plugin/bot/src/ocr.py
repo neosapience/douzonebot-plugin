@@ -314,7 +314,8 @@ IMPORTANT RULES:
 3. For delivery app receipts (배달의민족, 쿠팡이츠, 요기요), the vendor_info should be the RESTAURANT, not the app company.
 4. Set confidence to "high" only if the OCR text clearly contains labeled vendor information.
 5. The "amount" should be the TOTAL amount (합계/총액), not individual item prices.
-6. Return ONLY the JSON object, no additional text."""
+6. **Missing/unknown fields ≠ invalid receipt.** If fields are labeled "unknown", "N/A", "?", or left blank, treat them as null. As long as ANY recognizable receipt info (vendor name, amount, date, or biz number) is present, set is_receipt=true. Only set is_receipt=false if the text is clearly NOT a receipt (e.g., random notes, blank template with no real data).
+7. Return ONLY the JSON object, no additional text."""
 
 
 class ReceiptExtractor:
@@ -1132,6 +1133,23 @@ async def extract_receipt_from_text(
     receipt.raw_text = ocr_text
     receipt.provider = f"preocr_{provider_name}"
     receipt.source_path = image_path
+
+    # Safety net: if is_receipt=False but we have ANY identifiable receipt data,
+    # override to True. Users may have .ocr.md files with partial/unknown fields
+    # that should still be usable for matching.
+    if not receipt.is_receipt:
+        has_data = bool(
+            (receipt.vendor_info and receipt.vendor_info.name)
+            or (receipt.vendor_info and receipt.vendor_info.biz_num)
+            or (receipt.transaction and receipt.transaction.amount)
+            or (receipt.transaction and receipt.transaction.date)
+        )
+        if has_data:
+            logger.info(
+                f"Pre-OCR marked is_receipt=false but has data; overriding to true. "
+                f"vendor={receipt.vendor_info.name}, amount={receipt.transaction.amount}"
+            )
+            receipt.is_receipt = True
 
     logger.info(f"Pre-OCR extraction complete. Vendor: {receipt.vendor_info.name}, "
                 f"Confidence: {receipt.confidence}")
