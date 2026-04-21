@@ -3085,8 +3085,8 @@ class DouzoneAutomation:
 
             if valid_receipts:
                 # Has receipt(s) - fill supplier info and attach file(s)
-                if data.needs_supplier_info:
-                    debug.state("Needs supplier info, filling...")
+                if data.has_supplier_data:
+                    debug.state("Supplier data present, filling...")
                     # 실공급자상호
                     if data.supplier_name:
                         supplier_input = self.page.locator(
@@ -3096,6 +3096,11 @@ class DouzoneAutomation:
                             await supplier_input.fill(data.supplier_name)
                             debug.fill("실공급자상호", data.supplier_name)
                             logger.info(f"Filled 실공급자상호: {data.supplier_name}")
+                        else:
+                            logger.warning(
+                                "실공급자상호 input not visible — field was not written "
+                                f"(merchant={data.merchant})"
+                            )
 
                     # 실공급자 사업자등록번호
                     if data.supplier_biz_no:
@@ -3106,6 +3111,23 @@ class DouzoneAutomation:
                             await biz_input.fill(data.supplier_biz_no)
                             debug.fill("사업자번호", data.supplier_biz_no)
                             logger.info(f"Filled 사업자번호: {data.supplier_biz_no}")
+                        else:
+                            logger.warning(
+                                "실공급자 사업자등록번호 input not visible — "
+                                f"field was not written (merchant={data.merchant})"
+                            )
+                elif data.requires_supplier_info:
+                    # Receipt attached but OCR failed to extract supplier info.
+                    # Surface a warning in 비고 so the user sees it and can fix
+                    # manually. Without this branch the row silently submits
+                    # with empty 실공급자 fields.
+                    warn = "⚠️ 실공급자 정보 OCR 미추출 — 수동 확인 필요"
+                    if warn not in (data.bigo_notes or []):
+                        data.bigo_notes.append(warn)
+                    logger.warning(
+                        f"Row merchant={data.merchant} requires supplier info "
+                        f"but OCR extracted neither name nor biz_no — 비고에 경고 추가"
+                    )
 
                 # Attach receipt file(s)
                 attached_receipts = []
@@ -3121,9 +3143,10 @@ class DouzoneAutomation:
                 # Store which receipts actually attached for post-verification
                 data._attached_receipts = attached_receipts
 
-            elif data.needs_supplier_info:
-                # Missing receipt for a transaction that needs supplier info
-                # Add note to 비고 field
+            elif data.requires_supplier_info or data.has_supplier_data:
+                # Missing receipt for a transaction that requires supplier info
+                # (merchant-driven) OR already has some stray supplier data.
+                # Add note to 비고 field so the user knows to attach a receipt.
                 pending_reason = (
                     getattr(data, "pending_reason", None) or "영수증 미첨부"
                 )

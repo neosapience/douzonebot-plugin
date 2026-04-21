@@ -163,6 +163,19 @@ RECEIPT_REQUIRED_MERCHANTS = [
     '이마트', '홈플러스', '롯데마트', '코스트코',
 ]
 
+# Merchants where 실공급자상호 + 실공급자 사업자등록번호 MUST be filled.
+# These are PG/백화점 style merchants where the card statement shows the
+# payment gateway or mall operator, not the actual vendor. Physical receipt
+# is required to read the real supplier details.
+SUPPLIER_REQUIRED_MERCHANTS = [
+    '우아한형제', '배달의민족', '배민',                          # 배민
+    '현대백화점',                                                # 현대백화점 전지점
+    '신세계프라퍼티', '코엑스몰', '코엑스',                      # 신세계프라퍼티(코엑스몰)
+    '나이스정보통신', '나이스정보',                              # NICE 정보통신
+    '엔에이치엔한국사이버결제', '한국사이버결제', 'NHN KCP', 'KCP',  # NHN KCP
+    '케이지이니시스', '이니시스', 'INICIS',                      # KG이니시스
+]
+
 
 # ============================================================================
 # DATA MODELS
@@ -1357,6 +1370,7 @@ class MVPOrchestrator:
             "bigo_notes": expense.bigo_notes,
             "needs_yongdo": expense.needs_yongdo,
             "needs_content": expense.needs_content,
+            "requires_supplier_info": expense.requires_supplier_info,
         }
 
     def _is_already_filled(self, tx: Transaction) -> bool:
@@ -1867,6 +1881,7 @@ class MVPOrchestrator:
             self._is_pg_merchant(merchant)
             or self._is_saas_merchant(merchant)
             or self._requires_receipt_attachment(merchant)
+            or self._requires_supplier_info(merchant)
         )
 
     def _determine_yongdo(self, tx: Transaction, receipt_time: Optional[str] = None) -> str:
@@ -2066,6 +2081,11 @@ class MVPOrchestrator:
         merchant_lower = merchant.lower()
         return any(kw.lower() in merchant_lower for kw in RECEIPT_REQUIRED_MERCHANTS)
 
+    def _requires_supplier_info(self, merchant: str) -> bool:
+        """Check if merchant requires 실공급자상호/실공급자번호 to be filled."""
+        merchant_lower = (merchant or '').lower()
+        return any(kw.lower() in merchant_lower for kw in SUPPLIER_REQUIRED_MERCHANTS)
+
     def _build_execution_plan(self) -> ExecutionPlan:
         """Build ExecutionPlan from the reviewed ProcessingPlan."""
         if not self.plan:
@@ -2088,14 +2108,28 @@ class MVPOrchestrator:
                 skip_reason = None
 
             expense_data = row.to_expense_data()
+            # Compute merchant-driven requirement flag (independent of OCR output).
+            requires_supplier = (
+                self._requires_supplier_info(tx.merchant)
+                or self._is_pg_merchant(tx.merchant)
+            )
+            expense_data.requires_supplier_info = requires_supplier
             fill_data = self._expense_data_to_dict(expense_data)
-            # Supplier info is preserved for all merchants (not just PG) if OCR extracted it.
-            # The popup's 실공급자 fields are only visible/writable when the merchant type
-            # requires them, so fill_popup's is_visible() check handles the rest.
 
             bigo_notes: List[str] = []
             if row.pending_reason:
                 bigo_notes.append(f"[영수증 대기] {row.pending_reason}")
+
+            # Early warning: merchant requires supplier info but OCR didn't extract it.
+            # Surface this in 비고 so the user sees it before/at automation time.
+            if (
+                requires_supplier
+                and not expense_data.has_supplier_data
+                and not self._is_already_filled(tx)
+            ):
+                warn_note = "⚠️ 실공급자 정보 수동 확인 필요 (OCR 미추출)"
+                if warn_note not in bigo_notes:
+                    bigo_notes.append(warn_note)
 
             row_action = RowAction(
                 row_number=tx.row_num,
@@ -2488,6 +2522,11 @@ class MVPOrchestrator:
             bigo_notes=row_action.bigo_notes or [],
             needs_yongdo=bool(needs_yongdo),
             needs_content=bool(needs_content),
+            requires_supplier_info=bool(
+                fd.get("requires_supplier_info")
+                or self._requires_supplier_info(fd.get("merchant", ""))
+                or self._is_pg_merchant(fd.get("merchant", ""))
+            ),
         )
 
     def _refresh_execution_counts(self, plan: ExecutionPlan) -> None:
@@ -2793,14 +2832,25 @@ class MVPOrchestrator:
         return issues
 
     def _check_pg_missing_supplier(self, plan: ExecutionPlan) -> List['VerificationIssue']:
-        """Check for PG merchant rows missing supplier info."""
+        """Check rows that require 실공급자 info but have it missing.
+
+        Covers PG merchants and other SUPPLIER_REQUIRED_MERCHANTS
+        (배민/백화점/코엑스/NICE/NHN KCP/이니시스 등).
+
+        Scans SUCCESS and FAILED rows — a failed row for a required merchant
+        still needs to be surfaced for manual attention.
+        """
         # Uses VerificationIssue, VerificationIssueType from top-level import
         issues = []
+        scanned_statuses = {
+            ExecutionStatus.SUCCESS.value,
+            ExecutionStatus.FAILED.value,
+        }
         for row in plan.rows:
-            if row.execution_status != ExecutionStatus.SUCCESS.value:
+            if row.execution_status not in scanned_statuses:
                 continue
             merchant = (row.transaction or {}).get('merchant', '')
-            if not self._is_pg_merchant(merchant):
+            if not (self._requires_supplier_info(merchant) or self._is_pg_merchant(merchant)):
                 continue
             fill = row.fill_data or {}
             supplier_name = fill.get('supplier_name', '')
@@ -2812,12 +2862,15 @@ class MVPOrchestrator:
                     missing.append('실공급자상호')
                 if not supplier_biz_no:
                     missing.append('실공급자번호')
+                status_suffix = ""
+                if row.execution_status == ExecutionStatus.FAILED.value:
+                    status_suffix = " [행 실행 실패]"
                 issues.append(VerificationIssue(
                     issue_type=VerificationIssueType.PG_MISSING_SUPPLIER.value,
                     row_numbers=[row.row_number],
                     merchant=merchant,
                     amount=amount,
-                    description=f"PG 거래 ({merchant}) {', '.join(missing)} 누락",
+                    description=f"실공급자 정보 필요 거래처 ({merchant}) {', '.join(missing)} 누락{status_suffix}",
                 ))
         return issues
 
@@ -2958,7 +3011,7 @@ class MVPOrchestrator:
 
         type_labels = {
             VerificationIssueType.PG_MISSING_RECEIPT.value: "📎 PG 거래 영수증 누락",
-            VerificationIssueType.PG_MISSING_SUPPLIER.value: "🏢 PG 거래 실공급자 정보 누락",
+            VerificationIssueType.PG_MISSING_SUPPLIER.value: "🏢 실공급자 정보 누락 (배민/백화점/PG 등)",
             VerificationIssueType.CHARGE_CANCEL_PAIR.value: "🔄 결제+취소 쌍 불일치",
             VerificationIssueType.PARKING_OVER_CAP.value: "🅿️ 주차비 한도 초과",
         }

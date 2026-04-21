@@ -95,10 +95,22 @@ class ExpenseData:
     needs_yongdo: bool = False  # True if 용도 column needs to be filled
     needs_content: bool = False  # True if 내용 column needs to be filled
 
+    # True when merchant is in SUPPLIER_REQUIRED_MERCHANTS (배민/백화점/PG 등).
+    # Set by orchestrator._build_execution_plan based on merchant rules —
+    # independent of whether supplier data was actually extracted.
+    requires_supplier_info: bool = False
+
+    @property
+    def has_supplier_data(self) -> bool:
+        """Whether OCR/matching produced any supplier info for this row."""
+        return bool(self.supplier_name or self.supplier_biz_no)
+
     @property
     def needs_supplier_info(self) -> bool:
-        """Check if this expense requires supplier info (배민/PG)."""
-        return bool(self.supplier_name or self.supplier_biz_no)
+        """Deprecated alias — historically checked data presence, not requirement.
+        Kept for backward compat; new code should use has_supplier_data or
+        requires_supplier_info explicitly."""
+        return self.has_supplier_data
 
     @property
     def has_receipt(self) -> bool:
