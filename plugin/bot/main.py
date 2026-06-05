@@ -90,6 +90,27 @@ def setup_logging(debug_mode: bool = False, quiet_mode: bool = False, log_file: 
 logger = logging.getLogger(__name__)
 
 
+def _parse_row_list(spec: str):
+    """Parse a comma-separated row list like '30,40,46,52' to a set of ints.
+
+    Empty / missing input returns an empty set. Bad tokens are skipped with a
+    warning rather than crashing — the rest of the run shouldn't fail because
+    of a typo in one row number.
+    """
+    if not spec:
+        return set()
+    rows = set()
+    for tok in spec.split(','):
+        tok = tok.strip()
+        if not tok:
+            continue
+        try:
+            rows.add(int(tok))
+        except ValueError:
+            logger.warning(f"Ignoring invalid row number: {tok!r}")
+    return rows
+
+
 # ============================================================================
 # MVP MODE
 # ============================================================================
@@ -168,6 +189,8 @@ async def run_mvp_mode(args, config: AppConfig = None):
     if max_rows > 0:
         print(f"\n⚠️  LIMITED MODE: Processing only first {max_rows} row(s)")
     
+    lost_receipt_rows = _parse_row_list(getattr(args, 'mark_lost_receipt', ''))
+
     result = await run_mvp(
         user_name=args.user,
         memo_path=args.memo,
@@ -175,6 +198,7 @@ async def run_mvp_mode(args, config: AppConfig = None):
         cdp_url=args.cdp_url,
         test_mode=args.test_mode,
         auto_approve=getattr(args, 'auto_approve', False),
+        lost_receipt_rows=lost_receipt_rows,
         stage1_cache_in=args.stage1_cache_in,
         stage1_cache_out=args.stage1_cache_out,
         stage1_report_out=args.stage1_report_out,
@@ -1006,6 +1030,16 @@ Receipt OCR only (debug only):
         "--preflight-only",
         action="store_true",
         help="Run pre-flight checks and exit without running automation"
+    )
+    parser.add_argument(
+        "--mark-lost-receipt",
+        type=str,
+        default="",
+        metavar="ROWS",
+        help="Comma-separated row numbers to mark as '영수증 분실'. "
+             "Writes '[영수증 대기] 영수증 분실' to 비고 and suppresses the "
+             "PG-missing-receipt post-verify warning for these rows. "
+             "Example: --mark-lost-receipt 30,40,46,52"
     )
 
     args = parser.parse_args()

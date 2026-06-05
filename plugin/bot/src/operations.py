@@ -212,3 +212,35 @@ async def fill_supplier(
         'supplier_name': name,
         'supplier_biz_no': biz_no,
     })
+
+
+async def mark_lost_receipt(
+    auto: 'DouzoneAutomation',
+    row: int,
+    supplier_name: Optional[str] = None,
+    supplier_biz_no: Optional[str] = None,
+    reason: str = "영수증 분실",
+) -> bool:
+    """
+    Mark a row as receipt-lost.
+
+    Writes "[영수증 대기] {reason}" to 비고 (matching the marker format used
+    by the matcher pipeline) and optionally fills 실공급자 fields when the
+    user has the real vendor info but not the physical receipt.
+
+    Post-verify's _check_pg_missing_receipts recognizes this marker (and the
+    LOST_RECEIPT_MARKERS list in orchestrator) and won't re-flag the row.
+
+    Row is 1-based. `reason` must be one of the strings in
+    Orchestrator.LOST_RECEIPT_MARKERS for the post-verify skip to engage.
+
+    Returns True on success.
+    """
+    fields: Dict[str, str] = {
+        'bigo': f"[영수증 대기] {reason}",
+    }
+    if supplier_name:
+        fields['supplier_name'] = supplier_name
+    if supplier_biz_no:
+        fields['supplier_biz_no'] = supplier_biz_no
+    return await edit_row(auto, row, fields)

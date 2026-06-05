@@ -75,6 +75,29 @@ def wait_for_port(port, timeout=10):
     return False
 
 
+def _cdp_responds(port: int, timeout: float = 1.0) -> bool:
+    try:
+        resp = urllib.request.urlopen(f"http://localhost:{port}/json/version", timeout=timeout)
+        return resp.status == 200
+    except Exception:
+        return False
+
+
+def wait_for_cdp_ready(port, timeout=20):
+    """Wait until Chrome's CDP endpoint at `port` answers /json/version.
+
+    TCP listen alone is not enough — Chrome opens the port before CDP is wired up.
+    Polls every 0.25s. After the loop exits, makes one final probe to cover the
+    timeout-boundary case where Chrome became ready in the last interval.
+    """
+    start = time.time()
+    while time.time() - start < timeout:
+        if is_port_in_use(port) and _cdp_responds(port):
+            return True
+        time.sleep(0.25)
+    return _cdp_responds(port, timeout=2.0)
+
+
 def find_free_port(start=9444, scan_range=20):
     """Find a free TCP port starting from `start`.
 
@@ -208,11 +231,11 @@ def launch_chrome(auto_port=True):
                 stderr=subprocess.DEVNULL,
             )
 
-        if wait_for_port(port):
-            print(f"[+] Chrome listening on port {port}")
+        if wait_for_cdp_ready(port):
+            print(f"[+] Chrome CDP ready on port {port}")
             return True
         else:
-            print(f"[-] Chrome did not start on port {port} within timeout.")
+            print(f"[-] Chrome did not become CDP-ready on port {port} within timeout.")
             return False
     except Exception as e:
         print(f"[-] Error launching Chrome: {e}")

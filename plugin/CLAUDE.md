@@ -171,6 +171,19 @@ After the pipeline completes, a post-verification scan automatically checks for:
 2. **실공급자 정보 누락** — Missing supplier name or business number for PG transactions
 3. **결제+취소 쌍 불일치** — Charge+cancellation pairs where only one side was submitted
 4. **주차비 한도 초과** — Parking transactions exceeding 200,000원 per-transaction cap
+5. **🆕 미등록 PG 패턴** — Merchants matching PG/대행사 heuristics but absent from
+   any known list. Deferred to `/douzonebot:troubleshoot` 단계 4 for bounded
+   agent-driven extension (add to merchant list or write a new operations.py
+   helper, gated by `src/validate_extension.py`).
+6. **참석자 누락** (Rule 5) — SUCCESS rows whose 용도 requires an attendee
+   (식대 family, 회의비, 거래처식음료접대, 출장 식비, 간식/음료, 사내행사비)
+   but the field is empty. Interactive fix re-fills + saves the popup.
+7. **부분 환불** (Rule 3 unequal) — Same merchant, opposite-sign amounts within
+   3 days, both submitted, |charge| ≠ |cancel|. Surfaces the net amount the user
+   should claim instead.
+8. **접대비 형식** (Rule 8) — 거래처식음료접대 / 거래처경조사비 rows whose 참석자
+   lacks 소속/직급 keywords (e.g., '신우회계법인 김은서 과장'). Heuristic-based;
+   user gates false positives.
 
 Issues are reported, then interactive CLI prompts offer row-by-row fixes.
 Skip with `--skip-post-verify` flag.

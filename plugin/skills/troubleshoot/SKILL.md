@@ -1,9 +1,9 @@
 ---
 name: troubleshoot
-description: Automatically diagnose and fix common douzone-bot errors. Run this skill when the user reports an error (e.g., "it failed", "CDP error", "time out", "에러 났어", "안 돼") or when a previous douzonebot skill throws an unexpected error.
+description: Automatically diagnose and fix common douzone-bot errors, OR resolve unfixable post-verify issues (e.g., 미등록 PG 패턴) via the bounded agent-extension flow. Run this skill when the user reports an error ("it failed", "CDP error", "time out", "에러 났어", "안 돼") OR mentions post-verify findings ("리포트에 X 떴어", "verify에서 미등록 거래처", "STAGE 6에서 X").
 disable-model-invocation: false
 user-invocable: true
-allowed-tools: Bash, Read, Grep, AskUserQuestion
+allowed-tools: Bash, Read, Edit, Grep, AskUserQuestion
 argument-hint: "[error_message_or_symptom]"
 ---
 
@@ -70,3 +70,134 @@ done || echo "CDP_FAIL"
 - 사용자에게 친절하고 명확한 원인을 설명합니다.
 - 복잡한 해결책(예: Chrome 재시작)의 경우, "제가 해결해 드릴까요?" 라고 묻고 `/douzonebot:go`를 연계하여 바로 처리해 줍니다.
 - 스스로 해결할 수 없는 외부 요인(더존 서버 점검, 사용자 인증 만료)인 경우 사용자가 직접 해야 할 행동을 명확히 안내합니다.
+
+---
+
+## 단계 4 (별도 트랙): 사후 검증 결과 해결 (Post-Verify Resolution)
+
+파이프라인 STAGE 6 리포트가 `🆕 미등록 PG 패턴` 등 자동 처리되지 않은
+이슈를 남겼거나, 사용자가 "verify에서 X 떴어", "리포트에 미등록 거래처가
+나왔어"처럼 사후 검증 결과를 언급할 때 진입합니다.
+
+### 4-1. 이슈 확인
+
+```bash
+python3 -c "
+import json, sys
+from pathlib import Path
+p = Path.home() / 'douzone-bot' / 'cache' / 'execution_plan.json'
+if not p.exists():
+    sys.exit('no plan.json')
+data = json.loads(p.read_text(encoding='utf-8'))
+issues = (data.get('post_verification') or {}).get('issues', [])
+for i in issues:
+    if (not i.get('resolved')) or i.get('issue_type') == 'unknown_pattern':
+        print(f\"row {i['row_numbers']}: {i['issue_type']} — {i['merchant']} — {i['description']}\")
+"
+```
+
+`merchant`, `row_numbers`, `description`을 사용자에게 보여주고 무엇을
+처리할지 합의합니다.
+
+### 4-2. 처리 방식 (둘 중 하나만)
+
+**A. 데이터-only 추가 (제일 흔함)**
+- 새 거래처를 `models.py`의 `SUPPLIER_REQUIRED_MERCHANTS` 또는
+  `RECEIPT_REQUIRED_MERCHANTS` 리스트에 추가.
+- 사용자에게 한국어로 한 번 확인: "X가 PG/대행사 거래처가 맞나요? 영수증 +
+  실공급자 입력이 필요한 곳이라면 룰에 추가하겠습니다."
+- 승인 시 단 한 줄 추가.
+
+**B. 새 operation 추가 (드물지만 가능)**
+- `operations.py`에 새 async 헬퍼 작성 (예: `split_attendee`,
+  `fill_overseas_supplier`).
+- **반드시 기존 함수 / 기존에 사용 중인 `auto.<method>`만 사용**.
+  automation.py에 새 메서드 호출 또는 추가는 금지 — 이는 별도 PR로 분리.
+
+### 4-3. 편집 허용 범위 (Hard Rule)
+
+```
+허용 (이 스킬에서 수정 가능):
+  plugin/bot/src/operations.py
+  plugin/bot/src/models.py    (상수 리스트 추가만)
+
+금지 (절대 수정 금지):
+  automation.py / orchestrator.py / pipeline.py / ocr.py / 그 외 *.py
+```
+
+이 범위를 벗어나는 변경이 필요해 보이면 사용자에게 보고하고 멈춥니다:
+"이 변경은 자동 확장 범위 밖입니다 — 별도로 PR이 필요합니다."
+
+### 4-4. 검증 게이트 (필수)
+
+편집 전 백업 → 편집 → 검증. `REJECT` 시 절대 진행 금지, 반드시 백업 복원:
+
+```bash
+cd "<BOT_DIR>"
+cp src/operations.py src/operations.py.before
+# ... 여기서 편집 도구로 src/operations.py 수정 ...
+python3 src/validate_extension.py src/operations.py \
+  --baseline src/operations.py.before
+```
+
+검증기는 stdlib만 사용하므로 `uv run` 불필요 — 시스템 python3로 충분.
+
+- `OK` → 진행 (백업은 단계 4-7 이후 삭제)
+- `REJECT:` → 사유를 사용자에게 보여주고 `mv src/operations.py.before
+  src/operations.py`로 복원
+
+### 4-5. 플러그인↔루트 동기화
+
+`<BOT_DIR>/../../src/`가 존재하면(개발 저장소), **같은 diff를 양쪽에 모두**
+Edit 도구로 적용합니다. `cp`로 덮어쓰지 마세요 — 양쪽이 다른 이유로
+달라져 있을 수 있고, 그 차이를 잃습니다.
+
+```bash
+ROOT_SRC="<BOT_DIR>/../../src"
+test -d "$ROOT_SRC" && diff -q "<BOT_DIR>/src/operations.py" "$ROOT_SRC/operations.py"
+test -d "$ROOT_SRC" && diff -q "<BOT_DIR>/src/models.py" "$ROOT_SRC/models.py"
+```
+
+차이가 있으면 사용자에게 보고하고 멈춥니다 (sync 손상 가능성).
+사용자 환경(`~/douzone-bot/`만 있는 경우) `$ROOT_SRC`가 없으므로 이 단계를
+건너뜁니다.
+
+### 4-6. 한 행 dry-run
+
+새 operation을 추가한 경우, 한 행에만 시범 적용해 사용자가 Chrome에서
+확인하게 합니다 (데이터-only 추가는 dry-run 생략 가능, 다음 파이프라인
+실행 때 자동 적용됨):
+
+```bash
+cd "<BOT_DIR>" && uv run --with-requirements requirements-local.txt \
+  python -c "
+import asyncio
+from src.operations import connect, disconnect, <new_op>
+async def main():
+    auto = await connect('http://localhost:9444')
+    ok = await <new_op>(auto, row=<N>, ...)
+    print('OK' if ok else 'FAIL')
+    await disconnect(auto)
+asyncio.run(main())
+"
+```
+
+사용자가 "맞다" 확인 → 진행. "아니다"면 백업 복원.
+
+### 4-7. 정리 + 커밋 제안
+
+성공 시 백업 삭제 후, 사용자에게 커밋 제안 (CLAUDE.md 트레일러 형식 따라):
+
+```bash
+rm -f "<BOT_DIR>/src/operations.py.before"
+```
+
+```
+feat(merchants): add <merchant> to SUPPLIER_REQUIRED list
+
+Constraint: User-confirmed during YYYY-MM-DD troubleshoot session
+Confidence: medium
+Scope-risk: narrow
+```
+
+사용자가 직접 커밋할지 또는 다음 릴리스 때 묶을지 선택하게 합니다.

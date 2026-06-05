@@ -17,7 +17,7 @@ import logging
 import os
 import sys
 from dataclasses import dataclass, field
-from typing import List, Optional, Dict, Any, Tuple
+from typing import List, Optional, Dict, Any, Tuple, Set
 from pathlib import Path
 from datetime import datetime
 
@@ -109,6 +109,38 @@ PG_MERCHANTS = [
     '사이렌오더', '스타벅스사이렌', 'SIREN',
 ]
 
+# Heuristic patterns suggesting a PG/대행사 merchant not yet on any known list.
+# Surfaced as UNKNOWN_PATTERN during post-verify so /douzonebot:troubleshoot
+# can resolve it via the bounded agent-extension flow.
+PG_SUSPECT_PATTERNS = [
+    '결제대행', '결제 대행', '대행사',
+    'PG', '사이버결제', '정보통신', '페이먼트', 'PAYMENT',
+]
+
+# 용도 codes that require a non-empty 참석자 field (Rule 5: 참석자 기재 필수).
+ATTENDEE_REQUIRED_YONGDOS = {
+    "중식대", "석식대", "회식대", "회의비",
+    "거래처식음료접대",
+    "국내출장_식비", "국외출장_식비",
+    "간식/음료",
+    "사내행사비(워크샵,컬쳐데이)",
+}
+
+# 용도 codes for entertainment-with-business-partners (Rule 8: 소속/직급/성명 필요).
+ENTERTAINMENT_YONGDOS = {
+    "거래처식음료접대",
+    "거래처경조사비",
+}
+
+# Keywords indicating proper 접대비 attendee formatting (소속/직급).
+ENTERTAINMENT_TITLE_KEYWORDS = [
+    '회계법인', '법무법인', '세무법인', '법률사무소', '주식회사', '(주)',
+    '대표', '이사', '상무', '전무', '부사장', '회장',
+    '부장', '차장', '과장', '대리', '주임', '사원',
+    '팀장', '실장', '본부장', '센터장', '소장',
+    '교수', '박사', '회계사', '세무사', '변호사', '변리사',
+]
+
 # Merchants that are likely snacks/beverages
 SNACK_MERCHANTS = [
     '스타벅스', '커피', '카페', 'cafe', 'coffee', '빽다방', '이디야',
@@ -156,6 +188,13 @@ SAAS_VENDOR_MAP = {
 # Plausible KRW/USD exchange rate range for FX amount matching
 FX_RATE_MIN = 1100
 FX_RATE_MAX = 1600
+
+# Same-currency tolerance for SaaS receipt↔card matching. Overseas SaaS invoices
+# (OpenAI/Anthropic 등) are billed in KRW but the card statement amount differs by
+# FX/해외수수료, so an exact-amount match fails. e.g. 영수증 ₩144,545 vs 카드 148,229
+# (ratio 1.025). ±10% covers the typical FX+fee spread without colliding with
+# unrelated SaaS line items.
+SAAS_AMOUNT_TOLERANCE = 0.10
 
 # Large malls/department stores that require receipt attachment
 RECEIPT_REQUIRED_MERCHANTS = [
@@ -699,7 +738,10 @@ class MVPOrchestrator:
         for row in self.plan.rows:
             if (row.pending_receipt and not row.receipt_paths
                     and self._is_pg_merchant(row.transaction.merchant)):
-                row.pending_reason = "영수증 미첨부"
+                row.pending_reason = (
+                    "영수증 매칭 실패" if self._has_candidate_receipt(row.transaction.merchant)
+                    else "영수증 미첨부"
+                )
                 if not row.needs_clarification:
                     row.needs_clarification = True
                     row.confidence = "LOW"
@@ -1724,7 +1766,14 @@ class MVPOrchestrator:
             if not row.receipt_paths and self._might_need_receipt(tx.merchant):
                 row.pending_receipt = True
                 is_saas = self._is_saas_merchant(tx.merchant)
-                row.pending_reason = "SaaS 구독 영수증 미첨부" if is_saas else "영수증 미첨부"
+                # Distinguish '미첨부' (no receipt for this vendor) from '매칭 실패'
+                # (a plausible receipt exists but auto-match failed — usually FX
+                # amount drift). Different cause → different fix, so label them apart.
+                has_candidate = self._has_candidate_receipt(tx.merchant)
+                if is_saas:
+                    row.pending_reason = "SaaS 구독 영수증 매칭 실패" if has_candidate else "SaaS 구독 영수증 미첨부"
+                else:
+                    row.pending_reason = "영수증 매칭 실패" if has_candidate else "영수증 미첨부"
                 if not row.needs_clarification:
                      row.needs_clarification = True
                      row.confidence = "LOW"
@@ -2028,10 +2077,15 @@ class MVPOrchestrator:
                 if name_matched:
                     score += 2
 
-                # 3. FX-plausible amount
+                # 3. Amount corroboration: FX-plausible OR same-currency near-match.
+                #    Overseas SaaS bills in KRW but the card amount drifts by
+                #    FX/수수료, so allow a ±SAAS_AMOUNT_TOLERANCE same-currency band
+                #    in addition to the USD-style FX ratio band. Either is +1.
                 if receipt_amount and receipt_amount > 0 and tx.amount > 0:
                     ratio = tx.amount / receipt_amount
-                    if FX_RATE_MIN <= ratio <= FX_RATE_MAX:
+                    fx_plausible = FX_RATE_MIN <= ratio <= FX_RATE_MAX
+                    near_amount = (1 - SAAS_AMOUNT_TOLERANCE) <= ratio <= (1 + SAAS_AMOUNT_TOLERANCE)
+                    if fx_plausible or near_amount:
                         score += 1
 
                 # 4. Date within 35 days
@@ -2086,10 +2140,99 @@ class MVPOrchestrator:
         merchant_lower = (merchant or '').lower()
         return any(kw.lower() in merchant_lower for kw in SUPPLIER_REQUIRED_MERCHANTS)
 
+    @staticmethod
+    def _normalize_vendor_name(name: str) -> str:
+        """Normalize a 상호 for cross-vendor lookup: lowercase, collapse spaces."""
+        return ' '.join((name or '').lower().split())
+
+    def _backfill_supplier_biz_no(self) -> None:
+        """Backfill missing 실공급자 사업자번호 from sibling receipts of the same vendor.
+
+        A single receipt for a vendor may lack the 사업자번호 (OCR miss / not printed),
+        while other receipts from the same vendor in this batch carry it. When a row
+        has supplier_name but no supplier_biz_no, look up the number by normalized
+        상호 across all collected receipts and fill it in.
+
+        Without this, Post-verify (_check_pg_missing_supplier) flags the row and the
+        user re-enters a number that was already available elsewhere in the same run.
+        """
+        if not self.plan or not getattr(self, 'receipts', None):
+            return
+
+        # Build 상호 → 사업자번호 map from receipts that have BOTH.
+        biz_by_vendor: Dict[str, str] = {}
+        for receipt in self.receipts.values():
+            vi = getattr(receipt, 'vendor_info', None)
+            if not vi:
+                continue
+            name = self._normalize_vendor_name(getattr(vi, 'name', '') or '')
+            biz = (getattr(vi, 'biz_num', '') or '').strip()
+            if name and biz:
+                biz_by_vendor.setdefault(name, biz)
+
+        # Also seed from rows that already resolved both fields.
+        for row in self.plan.rows:
+            name = self._normalize_vendor_name(row.supplier_name or '')
+            biz = (row.supplier_biz_no or '').strip()
+            if name and biz:
+                biz_by_vendor.setdefault(name, biz)
+
+        if not biz_by_vendor:
+            return
+
+        filled = 0
+        for row in self.plan.rows:
+            if row.supplier_name and not (row.supplier_biz_no or '').strip():
+                key = self._normalize_vendor_name(row.supplier_name)
+                biz = biz_by_vendor.get(key)
+                if biz:
+                    row.supplier_biz_no = biz
+                    filled += 1
+                    print(f"   🔗 사업자번호 백필: {row.supplier_name} → {biz} "
+                          f"(Row {row.row_index + 1})")
+        if filled:
+            print(f"   사업자번호 교차 보완 {filled}건")
+
+    def _has_candidate_receipt(self, merchant: str) -> bool:
+        """True if an unmatched receipt plausibly belongs to `merchant`.
+
+        Used to distinguish '미첨부' (no receipt at all) from '매칭 실패'
+        (a likely-matching receipt exists but auto-match did not bind it).
+        Matches a SaaS vendor keyword against receipt vendor name or filename.
+        """
+        if not getattr(self, 'receipts', None):
+            return False
+        merchant_lower = (merchant or '').lower()
+        vendor_keywords: List[str] = []
+        for saas_kw, kws in SAAS_VENDOR_MAP.items():
+            if saas_kw in merchant_lower:
+                vendor_keywords.extend(kws)
+        if not vendor_keywords:
+            return False
+
+        matched_paths = set()
+        for row in self.plan.rows:
+            matched_paths.update(row.receipt_paths)
+
+        for path, receipt in self.receipts.items():
+            if path in matched_paths:
+                continue
+            vendor = ''
+            if getattr(receipt, 'vendor_info', None):
+                vendor = (receipt.vendor_info.name or '').lower()
+            filename = os.path.basename(path).lower()
+            if any(vk in vendor or vk in filename for vk in vendor_keywords):
+                return True
+        return False
+
     def _build_execution_plan(self) -> ExecutionPlan:
         """Build ExecutionPlan from the reviewed ProcessingPlan."""
         if not self.plan:
             raise ValueError("No ProcessingPlan available to build ExecutionPlan.")
+
+        # Cross-fill 사업자번호 from sibling receipts of the same vendor before
+        # rows are frozen into expense data (idempotent across review reruns).
+        self._backfill_supplier_biz_no()
 
         row_actions: List[RowAction] = []
 
@@ -2186,6 +2329,20 @@ class MVPOrchestrator:
         """
         if not self.plan:
             raise ValueError("No plan created. Run match_data() first.")
+
+        # Apply --mark-lost-receipt overrides before review prints / execution plan
+        # is built. Marker lands in pending_reason; the existing bigo builder picks
+        # it up as "[영수증 대기] 영수증 분실" and post-verify's LOST_RECEIPT_MARKERS
+        # check skips re-flagging these rows.
+        lost_rows = getattr(self, 'lost_receipt_rows', None) or set()
+        if lost_rows:
+            applied = 0
+            for row in self.plan.rows:
+                if row.row_number in lost_rows:
+                    row.pending_reason = "영수증 분실"
+                    applied += 1
+            if applied:
+                print(f"📎 영수증 분실 마커 적용: {applied}건 (rows={sorted(lost_rows)})")
 
         print("\n" + "="*60)
         print("📋 REVIEW & CONFIRM")
@@ -2754,6 +2911,10 @@ class MVPOrchestrator:
     PARKING_KEYWORDS = ['주차', '주차장', '주차비', '파킹', 'parking']
     PARKING_CAP = 200000  # 200,000원
 
+    # Markers in pending_reason / 비고 that indicate the user has already
+    # acknowledged the missing receipt — post-verify should not re-flag.
+    LOST_RECEIPT_MARKERS = ['영수증 분실', '영수증 누락', '영수증 폐기', '재발급 불가']
+
     def _parse_amount(self, amount_str) -> Optional[int]:
         """Parse amount from various formats to integer (won)."""
         if amount_str is None:
@@ -2811,6 +2972,12 @@ class MVPOrchestrator:
             merchant = (row.transaction or {}).get('merchant', '')
             if not self._might_need_receipt(merchant):
                 continue
+            # Refund/cancel rows (negative amount) have no receipt by nature —
+            # don't flag them as 'PG 영수증 누락'. Standalone cancels are surfaced
+            # separately by _check_charge_cancel_pairs as CANCEL_ONLY.
+            amount_signed = self._parse_amount((row.transaction or {}).get('amount'))
+            if amount_signed is not None and amount_signed < 0:
+                continue
             fill = row.fill_data or {}
             attached = fill.get('attached_receipts')
             if attached is not None:
@@ -2821,6 +2988,19 @@ class MVPOrchestrator:
                 receipt_paths = fill.get('receipt_paths', [])
                 has_valid_receipts = bool(receipt_paths)
             if not has_valid_receipts:
+                # User-acknowledged loss → don't re-flag.
+                # Marker can sit in pending_reason (matcher path) or 비고 (manual edit).
+                reason_text = (row.pending_reason or '').strip()
+                bigo_text = (fill.get('bigo') or fill.get('note') or '').strip()
+                marker_hit = any(
+                    m in reason_text or m in bigo_text
+                    for m in self.LOST_RECEIPT_MARKERS
+                )
+                # Supplier info already filled means user has independently
+                # established the real vendor — receipt is no longer load-bearing.
+                supplier_filled = bool(fill.get('supplier_name')) and bool(fill.get('supplier_biz_no'))
+                if marker_hit or supplier_filled:
+                    continue
                 amount = self._parse_amount((row.transaction or {}).get('amount')) or 0
                 issues.append(VerificationIssue(
                     issue_type=VerificationIssueType.PG_MISSING_RECEIPT.value,
@@ -2957,6 +3137,90 @@ class MVPOrchestrator:
                     matched_indices.add(i)
                     matched_indices.add(j)
                     break
+
+        # Pass 2: unequal charge+cancel pairs (partial refund pattern, Rule 3).
+        # Both rows submitted but charge ≠ |cancel| → user should claim only the net.
+        # Asymmetric+unequal is intentionally skipped (too noisy to flag reliably).
+        for i, a in enumerate(parsed_rows):
+            if i in matched_indices:
+                continue
+            if a['amount'] >= 0:
+                continue
+            for j, b in enumerate(parsed_rows):
+                if j in matched_indices or j == i:
+                    continue
+                if b['amount'] <= 0:
+                    continue
+                if abs(a['amount']) == abs(b['amount']):
+                    continue  # Equal case — handled in pass 1.
+                if not self._merchants_match(a['merchant'], b['merchant']):
+                    continue
+                try:
+                    from datetime import datetime as _dt
+                    date_a = date_b = None
+                    for fmt in ('%Y-%m-%d', '%Y.%m.%d', '%Y/%m/%d'):
+                        try:
+                            date_a = _dt.strptime(a['date_str'], fmt).date()
+                            break
+                        except ValueError:
+                            continue
+                    for fmt in ('%Y-%m-%d', '%Y.%m.%d', '%Y/%m/%d'):
+                        try:
+                            date_b = _dt.strptime(b['date_str'], fmt).date()
+                            break
+                        except ValueError:
+                            continue
+                    if date_a and date_b and abs((date_a - date_b).days) > 3:
+                        continue
+                except (ValueError, TypeError):
+                    pass
+
+                cancel_row = a['row']
+                charge_row = b['row']
+                cancel_submitted = cancel_row.execution_status == ExecutionStatus.SUCCESS.value
+                charge_submitted = charge_row.execution_status == ExecutionStatus.SUCCESS.value
+                if not (cancel_submitted and charge_submitted):
+                    continue
+
+                net = b['amount'] + a['amount']  # b is positive charge, a is negative cancel
+                desc = (
+                    f"부분 환불: 결제 {b['amount']:,}원 + 취소 {a['amount']:,}원 → "
+                    f"차액 {net:,}원만 청구 필요 (현재 둘 다 제출됨)"
+                )
+                issues.append(VerificationIssue(
+                    issue_type=VerificationIssueType.CHARGE_CANCEL_UNEQUAL.value,
+                    row_numbers=[charge_row.row_number],
+                    paired_row_number=cancel_row.row_number,
+                    merchant=b['merchant'],
+                    amount=abs(b['amount']),
+                    description=desc,
+                ))
+                matched_indices.add(i)
+                matched_indices.add(j)
+                break
+
+        # Pass 3: standalone cancels (negative, no matching charge in this batch).
+        # These are refunds the user submitted with no paired payment — there is no
+        # receipt to attach, so they must NOT read as 'PG 영수증 누락'. Surface them
+        # as an informational prompt to confirm the submission is intentional.
+        for i, a in enumerate(parsed_rows):
+            if i in matched_indices:
+                continue
+            if a['amount'] >= 0:
+                continue
+            cancel_row = a['row']
+            if cancel_row.execution_status != ExecutionStatus.SUCCESS.value:
+                continue
+            issues.append(VerificationIssue(
+                issue_type=VerificationIssueType.CANCEL_ONLY.value,
+                row_numbers=[cancel_row.row_number],
+                merchant=a['merchant'],
+                amount=abs(a['amount']),
+                description=(
+                    f"취소(환불)분만 존재 — 대응 결제건 없음 "
+                    f"({a['merchant']} {abs(a['amount']):,}원). 제출 여부 확인 필요"
+                ),
+            ))
         return issues
 
     def _check_parking_cap(self, plan: ExecutionPlan) -> List['VerificationIssue']:
@@ -2981,6 +3245,103 @@ class MVPOrchestrator:
                 ))
         return issues
 
+    def _matches_pg_suspect(self, merchant: str) -> bool:
+        """Heuristic: merchant name matches a PG/대행사-style pattern."""
+        if not merchant:
+            return False
+        m = merchant.lower()
+        return any(p.lower() in m for p in PG_SUSPECT_PATTERNS)
+
+    def _check_unknown_patterns(self, plan: ExecutionPlan) -> List['VerificationIssue']:
+        """
+        Flag merchants that LOOK like PG/대행사 but aren't on any known list.
+        Surfaces candidates for the agent-extensible operations flow
+        (/douzonebot:troubleshoot 단계 4).
+        """
+        # Uses VerificationIssue, VerificationIssueType from top-level import
+        issues = []
+        for row in plan.rows:
+            if row.execution_status != ExecutionStatus.SUCCESS.value:
+                continue
+            merchant = (row.transaction or {}).get('merchant', '') or ''
+            if not merchant:
+                continue
+            # Skip merchants already covered by other checks.
+            if self._requires_supplier_info(merchant) or self._is_pg_merchant(merchant):
+                continue
+            if not self._matches_pg_suspect(merchant):
+                continue
+            amount = self._parse_amount((row.transaction or {}).get('amount')) or 0
+            issues.append(VerificationIssue(
+                issue_type=VerificationIssueType.UNKNOWN_PATTERN.value,
+                row_numbers=[row.row_number],
+                merchant=merchant,
+                amount=amount,
+                description=f"미등록 PG 패턴 — '{merchant}'가 알려진 거래처 리스트에 없음",
+            ))
+        return issues
+
+    def _check_missing_attendees(self, plan: ExecutionPlan) -> List['VerificationIssue']:
+        """
+        Flag SUCCESS rows whose 용도 requires an attendee but field is empty.
+        Rule 5: 1인 식사라도 본인 이름 기재 필수.
+        """
+        # Uses VerificationIssue, VerificationIssueType from top-level import
+        issues = []
+        for row in plan.rows:
+            if row.execution_status != ExecutionStatus.SUCCESS.value:
+                continue
+            fill = row.fill_data or {}
+            yongdo = fill.get('yongdo') or ''
+            if yongdo not in ATTENDEE_REQUIRED_YONGDOS:
+                continue
+            attendees = (fill.get('attendees') or '').strip()
+            if attendees:
+                continue
+            merchant = (row.transaction or {}).get('merchant', '') or ''
+            amount = self._parse_amount((row.transaction or {}).get('amount')) or 0
+            issues.append(VerificationIssue(
+                issue_type=VerificationIssueType.MISSING_ATTENDEE.value,
+                row_numbers=[row.row_number],
+                merchant=merchant,
+                amount=amount,
+                description=f"참석자 누락 ({yongdo}) — 1인 식사라도 본인 이름 기재 필요",
+            ))
+        return issues
+
+    def _check_entertainment_format(self, plan: ExecutionPlan) -> List['VerificationIssue']:
+        """
+        Flag 거래처 접대 rows whose 참석자 lacks 소속/직급 keywords.
+        Rule 8: 접대 상대방의 소속/직급/성명 (예: '신우회계법인 김은서 과장').
+        """
+        # Uses VerificationIssue, VerificationIssueType from top-level import
+        issues = []
+        for row in plan.rows:
+            if row.execution_status != ExecutionStatus.SUCCESS.value:
+                continue
+            fill = row.fill_data or {}
+            yongdo = fill.get('yongdo') or ''
+            if yongdo not in ENTERTAINMENT_YONGDOS:
+                continue
+            attendees = (fill.get('attendees') or '').strip()
+            if not attendees:
+                continue  # Already caught by _check_missing_attendees.
+            if any(kw in attendees for kw in ENTERTAINMENT_TITLE_KEYWORDS):
+                continue
+            merchant = (row.transaction or {}).get('merchant', '') or ''
+            amount = self._parse_amount((row.transaction or {}).get('amount')) or 0
+            issues.append(VerificationIssue(
+                issue_type=VerificationIssueType.ENTERTAINMENT_FORMAT.value,
+                row_numbers=[row.row_number],
+                merchant=merchant,
+                amount=amount,
+                description=(
+                    f"접대비 형식 — 참석자 '{attendees}'에 소속/직급 누락 "
+                    f"(예: '신우회계법인 김은서 과장')"
+                ),
+            ))
+        return issues
+
     def _scan_all_issues(self, plan: ExecutionPlan) -> List['VerificationIssue']:
         """Run all post-verification checks and return sorted issues."""
         issues = []
@@ -2988,6 +3349,9 @@ class MVPOrchestrator:
         issues.extend(self._check_pg_missing_supplier(plan))
         issues.extend(self._check_charge_cancel_pairs(plan))
         issues.extend(self._check_parking_cap(plan))
+        issues.extend(self._check_unknown_patterns(plan))
+        issues.extend(self._check_missing_attendees(plan))
+        issues.extend(self._check_entertainment_format(plan))
         issues.sort(key=lambda i: i.row_numbers[0])
         return issues
 
@@ -3014,6 +3378,11 @@ class MVPOrchestrator:
             VerificationIssueType.PG_MISSING_SUPPLIER.value: "🏢 실공급자 정보 누락 (배민/백화점/PG 등)",
             VerificationIssueType.CHARGE_CANCEL_PAIR.value: "🔄 결제+취소 쌍 불일치",
             VerificationIssueType.PARKING_OVER_CAP.value: "🅿️ 주차비 한도 초과",
+            VerificationIssueType.UNKNOWN_PATTERN.value: "🆕 미등록 PG 패턴 (확인 필요)",
+            VerificationIssueType.MISSING_ATTENDEE.value: "👥 참석자 누락",
+            VerificationIssueType.CHARGE_CANCEL_UNEQUAL.value: "💱 부분 환불 (둘 다 제출됨)",
+            VerificationIssueType.ENTERTAINMENT_FORMAT.value: "🎭 접대비 형식 (소속/직급)",
+            VerificationIssueType.CANCEL_ONLY.value: "↩️ 취소분만 존재 (결제건 없음)",
         }
 
         for issue_type, group_issues in groups.items():
@@ -3242,6 +3611,107 @@ class MVPOrchestrator:
             issue.resolution = "skipped"
             print("     → 건너뜀")
 
+    async def _prompt_unknown_pattern(self, issue: 'VerificationIssue', plan: ExecutionPlan) -> None:
+        """
+        Surface UNKNOWN_PATTERN to the user without auto-fixing.
+
+        Resolution happens in /douzonebot:troubleshoot 단계 4 (bounded
+        agent-extensible flow): the agent proposes adding the merchant to
+        SUPPLIER_REQUIRED_MERCHANTS or writes a new operations.py helper,
+        runs validate_extension, dry-runs on one row, then persists.
+        """
+        row_num = issue.row_numbers[0]
+        print(f"\n  🆕 Row {row_num}: {issue.merchant} — 미등록 PG 패턴")
+        print(f"     /douzonebot:troubleshoot 로 확장 등록 가능")
+        issue.resolved = True
+        issue.resolution = "deferred_to_troubleshoot"
+
+    async def _set_attendee_on_row(
+        self, row_num: int, attendee: str, plan: ExecutionPlan
+    ) -> tuple:
+        """
+        Open popup, fill 참석자, save. Returns (success: bool, resolution_tag: str).
+        Shared by _prompt_fix_missing_attendee and _prompt_fix_entertainment_format.
+        """
+        idx = row_num - 1
+        if not await self.automation._open_popup_for_row(idx):
+            return False, "popup_open_failed"
+        try:
+            attendee_input = self.automation.page.locator(
+                'input[placeholder*="참석자"]'
+            ).first
+            if await attendee_input.is_visible():
+                await attendee_input.fill(attendee)
+        except Exception as e:
+            logger.error(f"Attendee fill failed for row {row_num}: {e}")
+            await self.automation.cancel_popup()
+            return False, "fill_failed"
+        if not await self.automation.save_popup():
+            return False, "save_failed"
+        for row in plan.rows:
+            if row.row_number == row_num and row.fill_data:
+                row.fill_data['attendees'] = attendee
+                break
+        return True, "fixed"
+
+    async def _prompt_fix_missing_attendee(self, issue: 'VerificationIssue', plan: ExecutionPlan) -> None:
+        """Interactive fix for missing 참석자 (Rule 5)."""
+        row_num = issue.row_numbers[0]
+        print(f"\n  👥 Row {row_num}: {issue.merchant} — 참석자 누락")
+        response = input("     참석자 입력 (1인 식사면 본인 이름 / 's' = skip): ").strip()
+        if response.lower() == 's' or not response:
+            issue.resolved = True
+            issue.resolution = "skipped"
+            print("     → 건너뜀")
+            return
+        ok, tag = await self._set_attendee_on_row(row_num, response, plan)
+        issue.resolved = True
+        issue.resolution = tag
+        if ok:
+            print(f"     ✅ 참석자 입력 완료: {response}")
+        else:
+            print(f"     ❌ {tag}")
+
+    async def _prompt_fix_unequal_pair(self, issue: 'VerificationIssue', plan: ExecutionPlan) -> None:
+        """Informational handler for unequal charge+cancel pairs (Rule 3 partial refund)."""
+        charge_row = issue.row_numbers[0]
+        cancel_row = issue.paired_row_number
+        print(f"\n  💱 Row {charge_row} + {cancel_row}: {issue.merchant} — 부분 환불 거래")
+        print(f"     {issue.description}")
+        print("     [s] 둘 다 건너뛰기 / [m] 수동 수정 (기본) / [k] 그대로 두기")
+        response = input("     선택: ").strip().lower()
+        if response == 's':
+            issue.resolved = True
+            issue.resolution = "skip_both"
+            print("     → 둘 다 건너뛰기 (수동 확인 필요)")
+        elif response == 'k':
+            issue.resolved = True
+            issue.resolution = "kept"
+            print("     → 그대로 둠 (사용자 확인 완료)")
+        else:
+            issue.resolved = True
+            issue.resolution = "manual_edit"
+            print("     → 차액 청구로 수동 수정 필요. /douzonebot:troubleshoot 로 row 수정 가능")
+
+    async def _prompt_fix_entertainment_format(self, issue: 'VerificationIssue', plan: ExecutionPlan) -> None:
+        """Interactive fix for 접대비 attendee missing 소속/직급 (Rule 8)."""
+        row_num = issue.row_numbers[0]
+        print(f"\n  🎭 Row {row_num}: {issue.merchant} — 접대비 형식 (소속/직급/성명)")
+        print(f"     예: '신우회계법인 김은서 과장' 또는 '(주)ABC 김민수 부장'")
+        response = input("     참석자 재입력 (또는 's' = skip): ").strip()
+        if response.lower() == 's' or not response:
+            issue.resolved = True
+            issue.resolution = "skipped"
+            print("     → 건너뜀")
+            return
+        ok, tag = await self._set_attendee_on_row(row_num, response, plan)
+        issue.resolved = True
+        issue.resolution = tag
+        if ok:
+            print(f"     ✅ 참석자 재입력 완료: {response}")
+        else:
+            print(f"     ❌ {tag}")
+
     async def post_verify(self, plan: ExecutionPlan) -> 'PostVerificationResult':
         """
         Run post-verification scan on completed execution plan.
@@ -3286,6 +3756,10 @@ class MVPOrchestrator:
                 VerificationIssueType.PG_MISSING_SUPPLIER.value: self._prompt_fix_supplier,
                 VerificationIssueType.CHARGE_CANCEL_PAIR.value: self._prompt_fix_pair,
                 VerificationIssueType.PARKING_OVER_CAP.value: self._prompt_fix_parking,
+                VerificationIssueType.UNKNOWN_PATTERN.value: self._prompt_unknown_pattern,
+                VerificationIssueType.MISSING_ATTENDEE.value: self._prompt_fix_missing_attendee,
+                VerificationIssueType.CHARGE_CANCEL_UNEQUAL.value: self._prompt_fix_unequal_pair,
+                VerificationIssueType.ENTERTAINMENT_FORMAT.value: self._prompt_fix_entertainment_format,
             }
 
             for issue in issues:
@@ -3570,6 +4044,7 @@ async def run_mvp(
     stage3_only: bool = False,
     review_only: bool = False,
     skip_post_verify: bool = False,
+    lost_receipt_rows: Optional[Set[int]] = None,
     provider=None,
 ) -> Dict[str, Any]:
     """
@@ -3637,5 +4112,6 @@ async def run_mvp(
     orchestrator.stage3_only = stage3_only
     orchestrator.review_only = review_only
     orchestrator.skip_post_verify = skip_post_verify
+    orchestrator.lost_receipt_rows = lost_receipt_rows or set()
 
     return await orchestrator.run(skip_transactions=test_mode)

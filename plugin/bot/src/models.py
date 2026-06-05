@@ -169,6 +169,11 @@ class VerificationIssueType(Enum):
     PG_MISSING_SUPPLIER = "pg_missing_supplier"
     CHARGE_CANCEL_PAIR = "charge_cancel_pair"
     PARKING_OVER_CAP = "parking_over_cap"
+    UNKNOWN_PATTERN = "unknown_pattern"
+    MISSING_ATTENDEE = "missing_attendee"
+    CHARGE_CANCEL_UNEQUAL = "charge_cancel_unequal"
+    ENTERTAINMENT_FORMAT = "entertainment_format"
+    CANCEL_ONLY = "cancel_only"
 
 
 @dataclass

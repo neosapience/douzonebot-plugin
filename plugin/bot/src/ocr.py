@@ -870,11 +870,14 @@ class ClaudeCodeReceiptExtractor:
             )
             
             if result.returncode != 0:
-                logger.error(f"Claude Code CLI failed: {result.stderr}")
+                # Interim failure — outer fallback loop will retry with another
+                # provider before this becomes user-visible. Stay at WARNING so
+                # successful retries don't leave ERROR lines in the log.
+                logger.warning(f"Claude Code CLI failed: {result.stderr}")
                 raise RuntimeError(f"Claude Code CLI error: {result.stderr}")
 
             if not result.stdout:
-                logger.error(f"Claude Code CLI returned empty stdout. stderr: {result.stderr}")
+                logger.warning(f"Claude Code CLI returned empty stdout. stderr: {result.stderr}")
                 raise RuntimeError(f"Claude CLI returned empty output (stdout=None). This may indicate too many concurrent processes. stderr: {result.stderr}")
 
             # Parse the JSON output from Claude Code
@@ -899,7 +902,7 @@ class ClaudeCodeReceiptExtractor:
             return result
             
         except subprocess.TimeoutExpired:
-            logger.error(f"Claude Code CLI timed out after {self.timeout}s")
+            logger.warning(f"Claude Code CLI timed out after {self.timeout}s")
             raise
         except json.JSONDecodeError as e:
             logger.error(f"Failed to parse Claude Code output: {e}")
