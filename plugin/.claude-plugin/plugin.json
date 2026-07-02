@@ -1,7 +1,7 @@
 {
   "name": "douzonebot",
   "description": "더존 경비 자동화 도우미.",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "author": {
     "name": "Yeonghyeon Lee"
   },

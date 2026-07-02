@@ -323,7 +323,7 @@ class ReceiptExtractor:
     Extract vendor and transaction information from receipt images using Claude Vision.
     
     Usage:
-        extractor = ReceiptExtractor(api_key="sk-ant-...")
+        extractor = ReceiptExtractor(api_key="<your-anthropic-api-key>")
         result = await extractor.extract("receipt.jpg")
         print(result.vendor_info.name)
     """
