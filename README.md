@@ -1,45 +1,67 @@
-# Douzone Expense Automation Plugin
+# Douzonebot Plugin Package
 
-[Claude Code](https://claude.ai/claude-code) plugin that automates STEP 2 (지출정보등록) of Douzone's expense claim process.
+This zip contains a self-contained Douzone expense automation plugin bundle for Codex/Claude users.
 
-- Reads your Douzone transaction grid automatically (Grid API)
-- Parses memo files (참석자 정보) and receipt images (영수증 OCR)
-- Matches memos/receipts to the correct transactions using AI
-- Fills in attendees, purpose, content, and attaches receipts — row by row
+## Contents
 
-## Install
+- `douzonebot/.claude-plugin/plugin.json` - plugin metadata
+- `douzonebot/skills/go/SKILL.md` - main workflow skill
+- `douzonebot/skills/troubleshoot/SKILL.md` - troubleshooting skill
+- `douzonebot/skills/uninstall/SKILL.md` - cleanup skill
+- `douzonebot/bot/` - Python automation runtime
+- `douzonebot/CLAUDE.md` - user-facing usage guide
 
+Runtime files, logs, local caches, screenshots, virtualenvs, and `.env` files are intentionally excluded.
+
+## Install For Claude/Codex
+
+Unzip the package, then copy or move the `douzonebot` folder into your plugin/skill location.
+
+Typical local plugin cache layout:
+
+```bash
+mkdir -p ~/.codex/plugins/cache/douzonebot-plugin/douzonebot
+cp -R douzonebot ~/.codex/plugins/cache/douzonebot-plugin/douzonebot/0.4.2
 ```
-/plugin marketplace add neosapience/douzonebot-plugin
-/plugin install douzonebot
+
+If your environment uses Claude plugin folders instead, place the `douzonebot` folder wherever your Claude plugin loader expects plugin bundles.
+
+## Use
+
+In Codex/Claude, ask:
+
+```text
+더존 자동화 해줘
 ```
 
-Then enable auto-update: `/plugin` → Marketplaces → `neosapience-douzonebot-plugin` → **Enable auto-update**
+or invoke the skill directly if your client supports skill names:
 
-## Usage
-
-```
+```text
 /douzonebot:go
 ```
 
-Or just ask in natural language:
+The workflow is:
 
-```
-더존 자동화 "해줘"
-```
+1. Check environment and install/use `uv`
+2. Launch automation Chrome
+3. Run preflight
+4. Collect memo and receipt inputs
+5. Review matches with the user before execution
+6. Fill Douzone STEP 2
+7. Verify warnings and cleanup
 
-The agent handles everything: environment setup, Chrome launch, pre-flight checks, and automation execution.
+Meal rows must verify `용도` and `내용` by transaction or matched receipt time:
 
-## Skills
+- `10:30-14:00` -> `100. 중식대 / 점심식사`
+- `17:00-21:00` -> `110. 석식대 / 저녁식사`
 
-```
-/douzonebot:go            End-to-end automation (setup + Chrome + preflight + run)
-/douzonebot:troubleshoot  Diagnose errors
-/douzonebot:uninstall     Clean removal
-```
+For delivery/PG rows such as KCP, NICE, Inicis, Baemin, or Coupang Eats, use the actual restaurant/supplier from the receipt, not the payment platform name.
 
 ## Requirements
 
-- [Claude Code](https://claude.ai/claude-code) installed
-- Chrome browser (for Douzone web access)
-- Active Douzone login session
+- macOS, Windows Git Bash, or Linux
+- Chrome
+- `uv` (the skill can guide installation)
+- Access to Douzone/Amaranth expense STEP 2
+- Memo text file and receipt folder for full mode
+

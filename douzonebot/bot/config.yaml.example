@@ -27,6 +27,6 @@ providers:
 # OpenRouter settings (only needed if using openrouter provider)
 # Sign up at https://openrouter.ai to get an API key
 # openrouter:
-#   api_key: sk-or-v1-your-key-here
+#   api_key: "<your-api-key-here>"
 #   model: anthropic/claude-sonnet-4          # For text tasks (memo parsing, matching)
 #   vision_model: anthropic/claude-sonnet-4   # For receipt OCR (vision)
