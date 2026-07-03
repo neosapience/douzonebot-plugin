@@ -45,6 +45,69 @@ def is_supported_image(path: str) -> bool:
     return Path(path).suffix.lower() in SUPPORTED_INPUT_FORMATS
 
 
+def convert_pdf_to_image(
+    input_path: str,
+    output_dir: Optional[str] = None,
+    dpi: int = 200,
+    force: bool = False,
+) -> Optional[str]:
+    """Render the first page of a PDF to a JPG for OCR/matching.
+
+    Vision OCR (Claude/Gemini) cannot reliably read PDF, so PDF receipts are
+    rasterized to an image first. The ORIGINAL PDF is still what gets attached
+    to Douzone (attach_file supports application/pdf) — this conversion only
+    feeds the matching/OCR stage.
+
+    Uses PyMuPDF (fitz) if available. Returns the JPG path, or None if PyMuPDF
+    is not installed (caller should surface a clear warning rather than silently
+    dropping the receipt).
+    """
+    try:
+        import fitz  # PyMuPDF
+    except ImportError:
+        logger.warning(
+            "PyMuPDF (fitz) not installed — cannot rasterize PDF for OCR: %s. "
+            "Install with 'uv add PyMuPDF' or convert the PDF to JPG manually.",
+            input_path,
+        )
+        return None
+
+    input_path = Path(input_path)
+    if not input_path.exists():
+        raise FileNotFoundError(f"Input file not found: {input_path}")
+
+    if output_dir:
+        output_dir = Path(output_dir)
+    else:
+        output_dir = input_path.parent / "converted"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / (input_path.stem + OUTPUT_EXTENSION)
+
+    if output_path.exists() and not force:
+        logger.info(f"PDF already rasterized: {output_path}")
+        return str(output_path)
+
+    logger.info(f"Rasterizing PDF first page: {input_path} -> {output_path}")
+    try:
+        doc = fitz.open(str(input_path))
+        try:
+            if doc.page_count < 1:
+                logger.error(f"PDF has no pages: {input_path}")
+                return None
+            page = doc.load_page(0)
+            # zoom = dpi / 72 (PDF default is 72 dpi)
+            matrix = fitz.Matrix(dpi / 72.0, dpi / 72.0)
+            pix = page.get_pixmap(matrix=matrix)
+            pix.save(str(output_path), output=OUTPUT_FORMAT.lower())
+        finally:
+            doc.close()
+        logger.info(f"PDF rasterized successfully: {output_path}")
+        return str(output_path)
+    except Exception as e:
+        logger.error(f"Failed to rasterize PDF {input_path}: {e}")
+        return None
+
+
 def convert_image(
     input_path: str,
     output_dir: Optional[str] = None,

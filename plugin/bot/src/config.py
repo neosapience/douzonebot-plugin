@@ -118,6 +118,52 @@ def load_config(config_path: Optional[str] = None) -> AppConfig:
     return config
 
 
+def save_user_name(user_name: str, config_path: Optional[str] = None) -> Optional[str]:
+    """Persist ``user_name`` to config.yaml so it need not be re-entered each run.
+
+    Updates an existing config file in place (preserving other keys) or creates a
+    minimal one. Returns the path written, or None on failure (best-effort — a
+    write failure must never break the automation flow).
+
+    Search/target order when ``config_path`` is not given:
+        1. An existing config.yaml from the standard search paths.
+        2. Otherwise create ./config.yaml in the current directory.
+    """
+    if not YAML_AVAILABLE:
+        logger.warning("pyyaml not installed — cannot persist user_name")
+        return None
+    if not (user_name or "").strip():
+        return None
+
+    target = config_path
+    if not target:
+        for dir_path in _CONFIG_DIRS:
+            for filename in _CONFIG_FILENAMES:
+                candidate = os.path.join(dir_path, filename)
+                if os.path.isfile(candidate):
+                    target = candidate
+                    break
+            if target:
+                break
+    if not target:
+        target = os.path.join(".", "config.yaml")
+
+    try:
+        data = {}
+        if os.path.isfile(target):
+            with open(target, "r", encoding="utf-8") as f:
+                data = yaml.safe_load(f) or {}
+        data["user_name"] = user_name.strip()
+        os.makedirs(os.path.dirname(os.path.abspath(target)), exist_ok=True)
+        with open(target, "w", encoding="utf-8") as f:
+            yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False)
+        logger.info(f"Saved user_name to {target}")
+        return target
+    except Exception as e:
+        logger.warning(f"Failed to save user_name to {target}: {e}")
+        return None
+
+
 def apply_cli_overrides(config: AppConfig, args) -> AppConfig:
     """Apply CLI argument overrides to config.
 

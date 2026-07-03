@@ -3051,6 +3051,21 @@ class DouzoneAutomation:
                 else:
                     debug.error("참석자 input not visible!")
                     logger.warning("참석자 input not visible")
+            else:
+                # No attendee value. If the popup has a 참석자 field it is required,
+                # and the save will fail with a generic error — surface the real
+                # cause (the orchestrator normally defaults empty attendees to the
+                # --user name before reaching here, so this is a last-resort guard).
+                try:
+                    attendee_input = self.page.locator('input[placeholder*="참석자"]').first
+                    if await attendee_input.is_visible():
+                        logger.warning(
+                            f"참석자 미기재 (merchant={data.merchant}) — 저장이 실패할 수 있습니다. "
+                            f"메모에 참석자를 추가하거나 --user 기본값을 사용하세요."
+                        )
+                        debug.error("참석자 미기재 — 필수 항목 누락, 저장 실패 위험")
+                except Exception:
+                    pass
 
             # Fill 내용 (Content) - if provided and different from current
             if data.content:
@@ -3286,6 +3301,70 @@ class DouzoneAutomation:
     # File Attachment
     # =========================================================================
 
+    async def _list_attached_filenames(self) -> list:
+        """Best-effort read of filenames already attached in the open popup.
+
+        Douzone's `.ico_file` indicator shows a COUNT ("1개"), not names, so we
+        probe the file-list DOM for the actual filenames. Returns lowercased
+        basenames found (may be empty if the DOM exposes none — callers must
+        treat an empty result as "unknown", NOT "no attachments").
+
+        NOTE: selector coverage is heuristic and has NOT been verified against a
+        live Douzone popup — kept intentionally conservative so a mis-read never
+        causes a real receipt to be skipped.
+        """
+        names: list = []
+        selectors = [
+            '.file_list li', '.file_item', '[class*="file_name"]',
+            '[class*="fileName"]', '[class*="attach"] li', '[class*="upload"] li',
+        ]
+        for sel in selectors:
+            try:
+                loc = self.page.locator(sel)
+                count = await loc.count()
+                for i in range(count):
+                    el = loc.nth(i)
+                    txt = ""
+                    try:
+                        txt = (await el.inner_text()) or ""
+                    except Exception:
+                        pass
+                    if not txt:
+                        try:
+                            txt = (await el.get_attribute("title")) or ""
+                        except Exception:
+                            pass
+                    txt = (txt or "").strip().lower()
+                    if txt:
+                        names.append(txt)
+            except Exception:
+                continue
+        return names
+
+    async def _is_already_attached(self, file_path: str) -> bool:
+        """True only when we can positively confirm this file is already attached.
+
+        Compares the file's basename (and its stem) against filenames read from
+        the popup. Returns False when nothing is readable, so an unreadable DOM
+        results in a normal (re-)attach rather than a skipped receipt.
+        """
+        try:
+            existing = await self._list_attached_filenames()
+        except Exception:
+            return False
+        if not existing:
+            return False
+        base = os.path.basename(file_path).strip().lower()
+        stem = os.path.splitext(base)[0]
+        for name in existing:
+            if base and base in name:
+                return True
+            # Douzone may display without extension or with a suffix; match on stem
+            # only when it's specific enough to avoid false positives.
+            if stem and len(stem) >= 4 and stem in name:
+                return True
+        return False
+
     async def attach_file(self, file_path: str) -> bool:
         """
         Attach a file (receipt image) to the current expense popup.
@@ -3372,6 +3451,14 @@ class DouzoneAutomation:
         )
 
         try:
+            # Idempotency: if this exact file is already attached (e.g. a forced
+            # re-run via --only-rows), skip the upload to avoid duplicate
+            # attachments. Conservative — only skips on a positive filename match.
+            if await self._is_already_attached(file_path):
+                debug.state(f"Already attached (idempotent skip): {os.path.basename(file_path)}")
+                logger.info(f"Receipt already attached, skipping re-upload: {file_path}")
+                return True
+
             # Step 1: Find and click the visible file add button
             add_btn = self.page.locator("input.btn_fileAdd")
             count = await add_btn.count()

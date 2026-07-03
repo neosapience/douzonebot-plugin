@@ -39,6 +39,43 @@ allowed-tools: Bash, Read, Write, Edit, Glob, Grep, WebFetch, AskUserQuestion
 
 ---
 
+## 사전 OCR(.ocr.md) 작성 규약 ⭐
+
+에이전트가 영수증 텍스트를 직접 작성할 때(또는 사용자가 준비할 때)는 아래 규약을 **반드시** 따릅니다.
+영수증 이미지 옆에 같은 이름의 `.ocr.md`를 두면 Vision OCR을 건너뛰고 이 텍스트를 사용합니다
+(예: `receipt_0605.jpg` → `receipt_0605.ocr.md` 또는 `receipt_0605.jpg.ocr.md`). **PDF도 동일**
+(예: `invoice.pdf` → `invoice.pdf.ocr.md`).
+
+### 권장 템플릿
+
+```
+## 판매자 정보 (실공급자)
+상호: <실제 판매처 상호>
+사업자등록번호: <XXX-XX-XXXXX>
+
+## 거래 정보
+날짜: <YYYY-MM-DD>
+시간: <HH:MM>
+금액: <숫자만, 예: 45000>
+통화: KRW
+```
+
+### 필수 규칙
+
+- **PG/배달앱 영수증(배민·쿠팡이츠·요기요·카카오페이·NHN KCP·이니시스·나이스 등)은
+  `## 판매자 정보(실공급자)` 섹션에 실제 판매처(식당 등)의 `상호`와 `사업자등록번호`를
+  반드시 포함합니다.** 카드전표에 찍힌 대행사(우아한형제들/KCP 등)가 아니라 **실제 음식점**
+  기준입니다. 사업자등록번호가 빠지면 PG 세금계산 처리가 불가능하며, 봇이 review 단계에서
+  `⚠️ 실공급자 사업자등록번호 누락`으로 경고합니다.
+- 사업자등록번호는 `XXX-XX-XXXXX` 형식으로 적습니다.
+- 해외 SaaS 구독(Anthropic/OpenAI 등) 청구서는 상호(회사명)와 금액·날짜만 있어도 됩니다.
+- 모르는 값은 비워두되, 위 두 필드(상호·사업자번호)는 PG 거래에서 생략하지 않습니다.
+
+> 이 규약을 지키면 배민 등 PG 거래의 실공급자 사업자번호 누락(가장 흔한 수동 보정 원인)을
+> 방지할 수 있습니다.
+
+---
+
 ## 경로 규칙
 
 - **BOT_DIR**: 이 SKILL.md 파일의 grandparent 디렉토리 아래 `bot/` 폴더. 예: `plugin/skills/go/SKILL.md` → `plugin/skills/` → `plugin/` → `plugin/bot/`
@@ -187,10 +224,23 @@ AskUserQuestion으로 질문:
 
 CLI 모드(전체 또는 간단) 선택 시, 아래 정보를 수집합니다:
 
-1. **사용자 이름**: 사용자에게 직접 질문 (자유 텍스트 — AskUserQuestion 사용 금지)
+1. **사용자 이름**:
+   - 먼저 `config.yaml`에 저장된 이름이 있는지 확인합니다. 있으면 그 값을 사용하고 재질문하지 않습니다:
+     ```bash
+     export PATH="$HOME/.local/bin:$USERPROFILE/.local/bin:$PATH" && cd "<BOT_DIR>" && test -f config.yaml && grep -E "^user_name:" config.yaml || echo "NO_SAVED_USER"
+     ```
+   - 저장된 이름이 없으면 사용자에게 직접 질문합니다 (자유 텍스트 — AskUserQuestion 사용 금지).
+   - 새로 입력받은 경우, **다음 실행부터 자동 사용되도록 저장할지** 물어봅니다. 동의하면:
+     ```bash
+     export PATH="$HOME/.local/bin:$USERPROFILE/.local/bin:$PATH" PYTHONIOENCODING=utf-8 && cd "<BOT_DIR>" && uv run --with-requirements requirements-local.txt python main.py --local --user "<이름>" --save-user
+     ```
 2. **메모 파일** (전체 모드만): 메모 텍스트 파일 경로 → 파일 존재 확인 후 내용 미리보기
 3. **영수증 폴더** (전체 모드만): 영수증 폴더 경로 → 파일 개수 확인 (이미지 + PDF)
-   - **PDF 영수증 지원**: 이미지(JPG, PNG, HEIC)뿐만 아니라 PDF 파일도 영수증으로 처리됩니다.
+   - **PDF 영수증 지원**: 이미지(JPG, PNG, HEIC)뿐 아니라 PDF도 영수증으로 처리됩니다. PDF는
+     첫 페이지를 자동으로 이미지로 변환해 OCR/매칭에 사용합니다(첨부는 원본 형식 그대로). 변환에는
+     PyMuPDF가 필요하며 `requirements-local.txt`에 포함되어 자동 설치됩니다. 변환이 불가하면
+     조용히 누락되지 않고 **명확한 오류 메시지**로 표시되니, 그 경우 `.ocr.md` 동반 파일을
+     만들어 주세요.
    - **사전 OCR 지원**: 영수증 파일 옆에 `.ocr.md` (또는 `.ocr.txt`, `.ocr.json`) 파일이 있으면 Vision AI를 건너뛰고 해당 텍스트를 직접 사용합니다. OCR이 미리 준비된 영수증 폴더도 그대로 사용 가능합니다.
 
 메모/영수증이 없으면 해당 `--memo`/`--receipts` 플래그를 생략합니다 (기본 참석자만 입력됨).
@@ -296,7 +346,32 @@ export PATH="$HOME/.local/bin:$USERPROFILE/.local/bin:$PATH" PYTHONIOENCODING=ut
 - `--stage2-cache-in`: 4-4a에서 저장한 매칭 결과를 로드 (데이터 재수집 건너뜀)
 - `--auto-approve`: 에이전트가 이미 4-4b에서 검토했으므로 대화형 프롬프트 건너뜀
 
+**⏱️ 실행 시간 / 대량 처리 안내 (중요)**
+
+- 행당 약 8초(팝업 열기·입력·저장) 소요됩니다. 봇이 시작 시 **예상 소요 시간**을 출력합니다.
+- **행이 40개 이상이면 반드시 백그라운드로 실행**하세요. 포그라운드 실행은 기본 10분
+  타임아웃에 걸려 중간에 끊길 수 있습니다. Bash 도구의 `run_in_background: true`로 실행하고
+  주기적으로 출력을 확인합니다.
+- **중단되어도 안전합니다.** 상태 기반 스킵 덕분에 재실행하면 이미 처리된(적합) 행은
+  자동으로 건너뛰고 남은 행만 이어서 처리합니다 (중복 입력 없음). 끊기면 동일 명령을
+  다시 실행하면 됩니다.
+
 자동 입력 시에도 위 시간대 규칙을 적용해 `용도`와 `내용`을 확인하고, 비어 있거나 잘못된 기존 값을 모두 수정합니다. 참석자/실공급자/첨부파일만 입력하고 끝내면 안 됩니다.
+
+#### 4-4d. 특정 행만 보정 재실행 (선택)
+
+이미 '적합'이 된 행의 일부 필드(예: 배민 실공급자 사업자등록번호)를 뒤늦게 보정해야 하면
+`--only-rows`로 **해당 행만 강제 재처리**합니다 (나머지 행은 건너뜀). 영수증 재첨부는
+멱등 처리되어 중복되지 않으므로 안전합니다.
+
+```bash
+export PATH="$HOME/.local/bin:$USERPROFILE/.local/bin:$PATH" PYTHONIOENCODING=utf-8 NODE_NO_WARNINGS=1 && cd "<BOT_DIR>" && uv run --with-requirements requirements-local.txt python main.py --local -q --user "<이름>" --stage2-cache-in "$PLAN_FILE" --only-rows 6,10,54 --auto-approve --cdp-url http://localhost:$CDP_PORT
+```
+
+- 보정 전에 `.ocr.md`/메모에 올바른 값(실공급자 상호·사업자번호, 참석자 등)을 채운 뒤
+  4-4a 매칭을 다시 돌려 `$PLAN_FILE`을 갱신하고 `--only-rows`로 실행합니다.
+- 단일 행의 특정 필드만 직접 고치려면 `/douzonebot:troubleshoot`의 operations API
+  (`edit_row`, `fill_supplier`, `attach_receipt`)를 사용할 수도 있습니다.
 
 ### 4-5. 모니터링
 

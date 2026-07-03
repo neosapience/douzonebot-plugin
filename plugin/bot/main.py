@@ -190,6 +190,9 @@ async def run_mvp_mode(args, config: AppConfig = None):
         print(f"\n⚠️  LIMITED MODE: Processing only first {max_rows} row(s)")
     
     lost_receipt_rows = _parse_row_list(getattr(args, 'mark_lost_receipt', ''))
+    only_rows = _parse_row_list(getattr(args, 'only_rows', '')) or None
+    if only_rows:
+        print(f"\n🎯 대상 행 지정 모드: rows={sorted(only_rows)} (나머지 행은 건너뜀, 적합 행도 강제 재처리)")
 
     result = await run_mvp(
         user_name=args.user,
@@ -199,6 +202,7 @@ async def run_mvp_mode(args, config: AppConfig = None):
         test_mode=args.test_mode,
         auto_approve=getattr(args, 'auto_approve', False),
         lost_receipt_rows=lost_receipt_rows,
+        only_rows=only_rows,
         stage1_cache_in=args.stage1_cache_in,
         stage1_cache_out=args.stage1_cache_out,
         stage1_report_out=args.stage1_report_out,
@@ -1041,8 +1045,37 @@ Receipt OCR only (debug only):
              "PG-missing-receipt post-verify warning for these rows. "
              "Example: --mark-lost-receipt 30,40,46,52"
     )
+    parser.add_argument(
+        "--only-rows",
+        type=str,
+        default="",
+        metavar="ROWS",
+        help="Process ONLY these comma-separated 1-based grid rows, bypassing the "
+             "already-filled (적합/완료) skip. Use to correct specific rows post-hoc "
+             "(e.g. add missing 실공급자 사업자번호). Receipt re-attach is idempotent, "
+             "so re-processing is safe. Example: --only-rows 6,10,54"
+    )
+    parser.add_argument(
+        "--save-user",
+        action="store_true",
+        help="Persist --user to config.yaml (so the name need not be re-entered "
+             "each run) and exit. Example: --user 홍길동 --save-user"
+    )
 
     args = parser.parse_args()
+
+    # --save-user: persist the name to config.yaml and exit (no automation).
+    if getattr(args, "save_user", False):
+        from src.config import save_user_name
+        if not getattr(args, "user", None):
+            print("❌ --save-user requires --user <이름>")
+            sys.exit(1)
+        saved = save_user_name(args.user, getattr(args, "config", None))
+        if saved:
+            print(f"✅ 사용자 이름 '{args.user}'을(를) {saved}에 저장했습니다. 다음 실행부터 자동 사용됩니다.")
+            sys.exit(0)
+        print("⚠️ config.yaml 저장에 실패했습니다.")
+        sys.exit(1)
 
     # Setup logging
     debug_mode = getattr(args, 'debug', False)

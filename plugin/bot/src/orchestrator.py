@@ -29,7 +29,7 @@ from .automation import DouzoneAutomation
 from .transaction_parser import TransactionParser, Transaction, TransactionList
 from .pipeline import parse_memo, MemoData
 from .ocr import extract_receipt, extract_receipt_from_text, find_preocr_file, ReceiptData, CLAUDE_CODE_AVAILABLE
-from .image_converter import convert_image, is_heic_file, is_pdf_file
+from .image_converter import convert_image, convert_pdf_to_image, is_heic_file, is_pdf_file
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +38,13 @@ DEFAULT_STAGE1_CACHE_PATH = os.path.join("cache", "stage1_cache.json")
 DEFAULT_STAGE1_REPORT_DIR = "reports"
 DEFAULT_STAGE3_CACHE_PATH = os.path.join("cache", "execution_plan.json")
 RECEIPT_OCR_MAX_WORKERS = 10
+
+# Rough per-row automation cost (open popup + fill + attach + save). Used only to
+# print a wall-clock estimate so a large batch can be run in the background.
+SEC_PER_ROW_ESTIMATE = 8
+# At/above this row count, warn that a foreground run may hit a timeout and that
+# a resumed re-run is safe (already-filled rows auto-skip).
+BACKGROUND_ROW_THRESHOLD = 40
 
 # ============================================================================
 # PURPOSE CODE MAPPING (from Douzone 용도 코드)
@@ -390,6 +397,10 @@ class MVPOrchestrator:
         self.stage2_only = False  # Will be set by run_mvp if needed
         self.stage3_only = False  # Will be set by run_mvp if needed
         self.review_only = False  # Will be set by run_mvp if needed
+        # Optional targeted re-processing: when set, ONLY these 1-based grid row
+        # numbers are processed and they bypass the already-filled (적합/완료) skip.
+        # Used by --only-rows to correct specific rows post-hoc.
+        self.only_rows: Optional[Set[int]] = None
         self.skip_post_verify = False  # Will be set by run_mvp if needed
         
         # Data stores
@@ -914,6 +925,32 @@ class MVPOrchestrator:
                     logger.info(f"HEIC resolved to JPG: {path} -> {resolved_path}")
                 except Exception as e:
                     return {"index": index, "path": path, "error": f"HEIC conversion failed: {e}"}
+            elif is_pdf_file(path):
+                # If a pre-OCR companion (.ocr.md/.txt/.json) exists, no rendering is
+                # needed — the companion text is used below and the original PDF is
+                # attached. This must be checked BEFORE rasterizing so a PDF with a
+                # companion works even without PyMuPDF installed.
+                if find_preocr_file(path):
+                    resolved_path = path  # keep PDF; companion text used, PDF attached
+                else:
+                    # No companion → vision OCR needs an image. Rasterize the first
+                    # page to JPG. A clear error is surfaced (not silently dropped) if
+                    # PyMuPDF is missing or rendering fails.
+                    try:
+                        converted_dir = os.path.join(self.receipts_path, "converted")
+                        os.makedirs(converted_dir, exist_ok=True)
+                        jpg_path = os.path.join(converted_dir, os.path.splitext(filename)[0] + ".jpg")
+                        if not os.path.exists(jpg_path):
+                            converted = convert_pdf_to_image(path, converted_dir)
+                            if not converted:
+                                return {"index": index, "path": path,
+                                        "error": "PDF→이미지 변환 불가 (PyMuPDF 미설치 또는 렌더 실패) — "
+                                                 "매칭에서 제외됨. .ocr.md 동반 파일을 만들거나 수동으로 JPG 변환하세요."}
+                            jpg_path = converted
+                        resolved_path = jpg_path
+                        logger.info(f"PDF rasterized to JPG for OCR: {path} -> {resolved_path}")
+                    except Exception as e:
+                        return {"index": index, "path": path, "error": f"PDF conversion failed: {e}"}
 
             # Check for pre-prepared OCR companion file (next to JPG or HEIC)
             preocr_path = find_preocr_file(resolved_path)
@@ -2240,8 +2277,15 @@ class MVPOrchestrator:
             tx = row.transaction
             transaction_dict = tx.to_dict()
 
-            # Determine action
-            if self._is_already_filled(tx):
+            # Determine action.
+            # --only-rows: process ONLY the listed 1-based rows; those bypass the
+            # already-filled skip (targeted post-hoc correction), everything else
+            # is skipped. Without --only-rows, the normal already-filled gate applies.
+            if self.only_rows is not None and tx.row_num not in self.only_rows:
+                action = ActionType.SKIP.value
+                execution_status = ExecutionStatus.SKIPPED.value
+                skip_reason = "not_in_only_rows"
+            elif self.only_rows is None and self._is_already_filled(tx):
                 action = ActionType.ALREADY_FILLED.value
                 execution_status = ExecutionStatus.SKIPPED.value
                 skip_reason = "already_filled"
@@ -2250,7 +2294,21 @@ class MVPOrchestrator:
                 execution_status = ExecutionStatus.PENDING.value
                 skip_reason = None
 
+            is_processing = action in (ActionType.AUTO_FILL.value, ActionType.USER_CONFIRMED.value)
+
             expense_data = row.to_expense_data()
+
+            # Attendee is required by most 식대/회의 popups; an empty value makes the
+            # popup save fail ("Failed to save popup"). If a row will be processed but
+            # has no attendee (e.g. a memo matched only a receipt with no names),
+            # fall back to the default user so the save succeeds. Harmless for
+            # card/SaaS popups that lack a 참석자 field (fill_popup skips when absent).
+            if is_processing and not (expense_data.attendees or "").strip():
+                expense_data.attendees = self.user_name
+                logger.info(
+                    f"Row {tx.row_num}: empty attendee → defaulted to user '{self.user_name}'"
+                )
+
             # Compute merchant-driven requirement flag (independent of OCR output).
             requires_supplier = (
                 self._requires_supplier_info(tx.merchant)
@@ -2263,15 +2321,18 @@ class MVPOrchestrator:
             if row.pending_reason:
                 bigo_notes.append(f"[영수증 대기] {row.pending_reason}")
 
-            # Early warning: merchant requires supplier info but OCR didn't extract it.
-            # Surface this in 비고 so the user sees it before/at automation time.
-            if (
-                requires_supplier
-                and not expense_data.has_supplier_data
-                and not self._is_already_filled(tx)
-            ):
-                warn_note = "⚠️ 실공급자 정보 수동 확인 필요 (OCR 미추출)"
-                if warn_note not in bigo_notes:
+            # Early warning: PG/실공급자-required merchant is missing supplier data.
+            # Two cases: (a) nothing extracted, (b) 상호 present but 사업자등록번호
+            # missing (common when a hand-written .ocr.md omits the biz number — the
+            # critical field for PG tax filing). Surface in 비고 for pre/at-automation.
+            if requires_supplier and is_processing:
+                if not expense_data.has_supplier_data:
+                    warn_note = "⚠️ 실공급자 정보 수동 확인 필요 (OCR 미추출)"
+                elif not (expense_data.supplier_biz_no or "").strip():
+                    warn_note = "⚠️ 실공급자 사업자등록번호 누락 — 수동 확인 필요"
+                else:
+                    warn_note = None
+                if warn_note and warn_note not in bigo_notes:
                     bigo_notes.append(warn_note)
 
             row_action = RowAction(
@@ -2577,12 +2638,30 @@ class MVPOrchestrator:
         print(f"      금액: {tx.amount:,}원")
         print(f"      참석자: {row.attendees}")
 
+        # Supplier (실공급자) — for PG/대행 거래, 상호 + 사업자등록번호 are required.
+        requires_supplier = (
+            self._requires_supplier_info(tx.merchant) or self._is_pg_merchant(tx.merchant)
+        )
         if row.supplier_name:
-            print(f"      실공급자: {row.supplier_name} / {row.supplier_biz_no or 'N/A'}")
+            biz = (row.supplier_biz_no or "").strip()
+            if biz:
+                print(f"      실공급자: {row.supplier_name} / {biz}")
+            elif requires_supplier:
+                print(f"      실공급자: {row.supplier_name} / ⚠️ 사업자등록번호 누락")
+            else:
+                print(f"      실공급자: {row.supplier_name} / N/A")
+        elif requires_supplier:
+            print(f"      실공급자: ⚠️ 미입력 (PG/대행 거래 — 실공급자 상호+사업자등록번호 필요)")
 
         if row.receipt_paths:
             names = [os.path.basename(p) for p in row.receipt_paths]
-            print(f"      첨부: {', '.join(names)} ✅")
+            attach_mark = "✅"
+            # PG/대행 거래인데 사업자번호가 비면 첨부가 있어도 주의 표시.
+            if requires_supplier and not (row.supplier_biz_no or "").strip():
+                attach_mark = "⚠️ (실공급자 정보 확인 필요)"
+            print(f"      첨부: {', '.join(names)} {attach_mark}")
+        elif requires_supplier:
+            print(f"      첨부: ⚠️ 영수증 필요 (PG/대행 거래 — 실공급자 확인용)")
         elif row.pending_receipt:
             print(f"      첨부: ❌ 영수증 없음")
 
@@ -2799,6 +2878,15 @@ class MVPOrchestrator:
         
         total = len(rows_to_process)
         failures = []
+
+        # Estimate wall-clock so the agent/user can decide on background execution.
+        if total > 0:
+            est_min = max(1, round(total * SEC_PER_ROW_ESTIMATE / 60))
+            print(f"   ⏱️  예상 소요: 약 {est_min}분 ({total}행 × ~{SEC_PER_ROW_ESTIMATE}초/행)")
+            if total >= BACKGROUND_ROW_THRESHOLD:
+                print(f"   ℹ️  행이 많습니다({total}행). 포그라운드 실행이 타임아웃(예: 10분)에 걸릴 수 있으니")
+                print(f"      백그라운드 실행을 권장합니다. 중단되어도 이미 처리된 행은 자동 스킵되어")
+                print(f"      안전하게 재개됩니다(재실행 시 중복 없음).")
 
         if total == 0:
             print("\n✅ No pending rows to process.")
@@ -4045,6 +4133,7 @@ async def run_mvp(
     review_only: bool = False,
     skip_post_verify: bool = False,
     lost_receipt_rows: Optional[Set[int]] = None,
+    only_rows: Optional[Set[int]] = None,
     provider=None,
 ) -> Dict[str, Any]:
     """
@@ -4113,5 +4202,6 @@ async def run_mvp(
     orchestrator.review_only = review_only
     orchestrator.skip_post_verify = skip_post_verify
     orchestrator.lost_receipt_rows = lost_receipt_rows or set()
+    orchestrator.only_rows = only_rows if only_rows else None
 
     return await orchestrator.run(skip_transactions=test_mode)
